@@ -286,23 +286,6 @@ router.post('/create', authenticateAnyToken, rateLimitMiddleware, checkCaptchaRe
   try {
     const { email, domainId, expiresAt, captchaResponse } = req.body;
     
-    // Always check for captcha requirements first
-    if (res.locals.captchaRequired && !captchaResponse) {
-      // Store the email creation request data in the response
-      return res.status(400).json({
-        error: 'CAPTCHA_REQUIRED',
-        captchaRequired: true,
-        captchaSiteKey: res.locals.captchaSiteKey,
-        message: 'You have reached the email limit for this hour. Please complete the CAPTCHA to continue.',
-        // Include the necessary information to resubmit the request
-        pendingEmail: {
-          email,
-          domainId,
-          expiresAt
-        }
-      });
-    }
-    
     // Validate the required fields
     if (!email || !domainId) {
       return res.status(400).json({ error: 'Email and domain are required' });
@@ -701,18 +684,13 @@ router.post('/public/create', rateLimitMiddleware, checkCaptchaRequired, verifyC
     const { email, domainId } = req.body;
     const id = uuidv4();
     
-    // Always check for captcha requirements first
+    // Add CAPTCHA information to response if required
     if (res.locals.captchaRequired && !req.body.captchaResponse) {
       return res.status(400).json({
         error: 'CAPTCHA_REQUIRED',
         captchaRequired: true,
         captchaSiteKey: res.locals.captchaSiteKey,
-        message: 'You have reached the email limit for this hour. Please complete the CAPTCHA to continue.',
-        // Include the necessary information to resubmit the request
-        pendingEmail: {
-          email,
-          domainId
-        }
+        message: 'You have exceeded the rate limit. Please complete the CAPTCHA.'
       });
     }
     
@@ -1170,70 +1148,5 @@ router.post('/admin/bulk-send-external', async (req, res) => {
 
 // Compress responses
 router.use(compression());
-
-// Add a new route to check rate limit status
-router.get('/rate-limit-status', authenticateAnyToken, (req, res) => {
-  const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-  let rateInfo;
-  
-  // Get rate limit info based on auth status
-  if (req.user) {
-    const userId = req.user.id;
-    const userLimit = rateLimitStore.userLimits[userId] || { 
-      count: 0, 
-      resetAt: Date.now() + RATE_LIMIT.WINDOW_MS,
-      captchaRequired: false
-    };
-    
-    // Calculate emails remaining
-    const emailsRemaining = Math.max(0, RATE_LIMIT.AUTH_MAX_EMAILS_PER_HOUR - userLimit.count);
-    
-    // Calculate time until reset
-    const resetInMs = Math.max(0, userLimit.resetAt - Date.now());
-    const resetInMinutes = Math.ceil(resetInMs / (60 * 1000));
-    
-    rateInfo = {
-      emailsCreated: userLimit.count,
-      emailsRemaining: emailsRemaining,
-      resetInMinutes: resetInMinutes,
-      captchaRequired: userLimit.captchaRequired,
-      captchaThreshold: RATE_LIMIT.CAPTCHA_THRESHOLD
-    };
-    
-    // If captcha is required, include the site key
-    if (userLimit.captchaRequired) {
-      rateInfo.captchaSiteKey = getCurrentCaptchaSiteKey();
-    }
-  } else {
-    // For anonymous users
-    const ipLimit = rateLimitStore.limits[clientIp] || { 
-      count: 0, 
-      resetAt: Date.now() + RATE_LIMIT.WINDOW_MS,
-      captchaRequired: false
-    };
-    
-    // Calculate emails remaining
-    const emailsRemaining = Math.max(0, RATE_LIMIT.MAX_EMAILS_PER_HOUR - ipLimit.count);
-    
-    // Calculate time until reset
-    const resetInMs = Math.max(0, ipLimit.resetAt - Date.now());
-    const resetInMinutes = Math.ceil(resetInMs / (60 * 1000));
-    
-    rateInfo = {
-      emailsCreated: ipLimit.count,
-      emailsRemaining: emailsRemaining,
-      resetInMinutes: resetInMinutes,
-      captchaRequired: ipLimit.captchaRequired,
-      captchaThreshold: RATE_LIMIT.CAPTCHA_THRESHOLD
-    };
-    
-    // If captcha is required, include the site key
-    if (ipLimit.captchaRequired) {
-      rateInfo.captchaSiteKey = getCurrentCaptchaSiteKey();
-    }
-  }
-  
-  res.json(rateInfo);
-});
 
 export default router;
