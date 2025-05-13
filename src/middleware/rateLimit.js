@@ -100,6 +100,8 @@ const RATE_LIMIT = {
   WINDOW_MS: 60 * 60 * 1000, // 1 hour in milliseconds
   // Additional limits for authenticated users
   AUTH_MAX_EMAILS_PER_HOUR: 15, // Higher limit for authenticated users
+  // Threshold for showing captcha (one less than the max limit)
+  CAPTCHA_THRESHOLD: 14
 };
 
 // Rate limit middleware
@@ -125,8 +127,8 @@ export function rateLimitMiddleware(req, res, next) {
     // Increment count for this user
     rateLimitStore.userLimits[userId].count++;
     
-    // Check if rate limit is exceeded for authenticated user
-    if (rateLimitStore.userLimits[userId].count > RATE_LIMIT.AUTH_MAX_EMAILS_PER_HOUR) {
+    // Check if user is close to rate limit - proactively enable captcha
+    if (rateLimitStore.userLimits[userId].count >= RATE_LIMIT.CAPTCHA_THRESHOLD) {
       rateLimitStore.userLimits[userId].captchaRequired = true;
     }
     
@@ -154,11 +156,9 @@ export function rateLimitMiddleware(req, res, next) {
   // Increment count for this IP
   rateLimitStore.limits[clientIp].count++;
   
-  // Check if rate limit is exceeded
-  if (rateLimitStore.limits[clientIp].count > RATE_LIMIT.MAX_EMAILS_PER_HOUR) {
+  // Proactively trigger captcha at threshold
+  if (rateLimitStore.limits[clientIp].count >= RATE_LIMIT.CAPTCHA_THRESHOLD) {
     rateLimitStore.limits[clientIp].captchaRequired = true;
-    
-    // Don't block the request - we'll check for CAPTCHA in the route handler
   }
   
   // Add rateLimitInfo to request for use in route handlers
@@ -249,21 +249,55 @@ export function checkCaptchaRequired(req, res, next) {
   
   // Get rate limit info for the appropriate entity (user or IP)
   let isCaptchaRequired = false;
+  let count = 0;
+  let limit = RATE_LIMIT.MAX_EMAILS_PER_HOUR;
+  let resetAt = 0;
   
   if (req.user) {
     // For authenticated users
     const userId = req.user.id;
-    isCaptchaRequired = rateLimitStore.userLimits[userId]?.captchaRequired || false;
+    const userLimit = rateLimitStore.userLimits[userId];
+    if (userLimit) {
+      isCaptchaRequired = userLimit.captchaRequired;
+      count = userLimit.count;
+      limit = RATE_LIMIT.AUTH_MAX_EMAILS_PER_HOUR;
+      resetAt = userLimit.resetAt;
+    }
   } else {
     // For anonymous users
-    isCaptchaRequired = rateLimitStore.limits[clientIp]?.captchaRequired || false;
+    const ipLimit = rateLimitStore.limits[clientIp];
+    if (ipLimit) {
+      isCaptchaRequired = ipLimit.captchaRequired;
+      count = ipLimit.count;
+      resetAt = ipLimit.resetAt;
+    }
   }
+  
+  // Always add rate limit information to response
+  res.locals.rateLimit = {
+    count,
+    limit,
+    emailsRemaining: Math.max(0, limit - count),
+    captchaRequired: isCaptchaRequired,
+    captchaThreshold: RATE_LIMIT.CAPTCHA_THRESHOLD,
+    resetAt
+  };
   
   // Add CAPTCHA info to the response
   res.locals.captchaRequired = isCaptchaRequired;
   if (isCaptchaRequired) {
     res.locals.captchaSiteKey = getCurrentCaptchaSiteKey();
+    
+    // For API responses
+    res.setHeader('X-Captcha-Required', 'true');
+    res.setHeader('X-Captcha-Site-Key', getCurrentCaptchaSiteKey());
   }
+  
+  // For all API responses, add rate limit info
+  res.setHeader('X-Rate-Limit-Count', count.toString());
+  res.setHeader('X-Rate-Limit-Limit', limit.toString());
+  res.setHeader('X-Rate-Limit-Remaining', Math.max(0, limit - count).toString());
+  res.setHeader('X-Rate-Limit-Reset', resetAt.toString());
   
   next();
 }
