@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcryptjs';
 import { pool } from './db/init.js';
+import { recentRequests } from './middleware/requestTracker.js'; // Import recentRequests for migration tracking
 
 // In-memory storage for guest sessions
 // Using Map for better performance
@@ -568,6 +569,57 @@ export async function migrateGuestSessionToUser(token, userId, realEmail, realPa
       }
     }
 
+    // Record the migration in user_migrations table
+    const migrationId = uuidv4();
+    
+    // Try to get client IP and user agent from token or req
+    let clientIp = '';
+    let userAgent = '';
+    let country = '';
+    
+    // Check if there are any recent requests in the memory cache that match this user
+    // This uses the existing request tracking infrastructure
+    try {
+      // Look for request info in recent requests that might match this session
+      // This is an approximation, as we don't have direct access to request data here
+      const requests = Array.from(recentRequests?.byId?.values() || []);
+      if (requests.length > 0) {
+        // Find the most recent request that could be associated with this session
+        const recentRequest = requests
+          .filter(req => req.requestPath?.includes('/guest/save-inbox'))
+          .sort((a, b) => b.timestamp - a.timestamp)[0];
+          
+        if (recentRequest) {
+          clientIp = recentRequest.clientIp || '';
+          userAgent = recentRequest.userAgent || '';
+          country = recentRequest.geoCountry || '';
+        }
+      }
+    } catch (error) {
+      console.error('Error getting request info for migration logging:', error);
+    }
+    
+    // Record the migration in the database
+    await connection.query(
+      `INSERT INTO user_migrations (
+        id, user_id, user_email, migration_date, 
+        emails_migrated, emails_renamed, emails_skipped,
+        client_ip, user_agent, country, success
+      ) VALUES (?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        migrationId,
+        userId,
+        realEmail,
+        migrationResults.migratedEmails,
+        migrationResults.renamedEmails,
+        migrationResults.skippedEmails,
+        clientIp,
+        userAgent,
+        country,
+        true
+      ]
+    );
+
     // Commit the transaction
     await connection.commit();
     
@@ -581,6 +633,30 @@ export async function migrateGuestSessionToUser(token, userId, realEmail, realPa
   } catch (error) {
     await connection.rollback();
     console.error('Error migrating guest session:', error);
+    
+    // Try to record failed migration
+    try {
+      const migrationId = uuidv4();
+      await pool.query(
+        `INSERT INTO user_migrations (
+          id, user_id, user_email, migration_date, 
+          emails_migrated, emails_renamed, emails_skipped,
+          client_ip, user_agent, country, success, error_message
+        ) VALUES (?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          migrationId,
+          userId,
+          realEmail,
+          0, 0, 0,
+          '', '', '',
+          false,
+          error.message.substring(0, 1000) // Limit error message length
+        ]
+      );
+    } catch (logError) {
+      console.error('Failed to log failed migration:', logError);
+    }
+    
     return { success: false, error: error.message };
   } finally {
     connection.release();

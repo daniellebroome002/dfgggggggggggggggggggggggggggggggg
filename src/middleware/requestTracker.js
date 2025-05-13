@@ -3,7 +3,7 @@ import { pool } from '../db/init.js';
 import axios from 'axios';
 
 // Store recent requests in memory for quick access
-const recentRequests = {
+export const recentRequests = {
   // Structure: { [requestId]: requestData }
   byId: new Map(),
   // Structure: { [ip]: [requestIds] }

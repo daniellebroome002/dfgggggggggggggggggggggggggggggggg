@@ -695,4 +695,158 @@ router.get('/lookup-email-ip', async (req, res) => {
   }
 });
 
+// Migration monitoring endpoints
+
+// Get migration statistics
+router.get('/migration-stats', async (req, res) => {
+  if (!checkAdminPassphrase(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    // Get total migrations count
+    const [totalCount] = await connection.query(
+      'SELECT COUNT(*) as total FROM user_migrations'
+    );
+
+    // Get success/failure counts
+    const [successCount] = await connection.query(
+      'SELECT COUNT(*) as total FROM user_migrations WHERE success = TRUE'
+    );
+
+    const [failureCount] = await connection.query(
+      'SELECT COUNT(*) as total FROM user_migrations WHERE success = FALSE'
+    );
+
+    // Get total emails migrated/renamed/skipped
+    const [emailStats] = await connection.query(
+      `SELECT 
+        SUM(emails_migrated) as total_migrated,
+        SUM(emails_renamed) as total_renamed,
+        SUM(emails_skipped) as total_skipped
+      FROM user_migrations
+      WHERE success = TRUE`
+    );
+
+    // Get today's migrations
+    const [todayCount] = await connection.query(
+      'SELECT COUNT(*) as total FROM user_migrations WHERE DATE(migration_date) = CURDATE()'
+    );
+
+    // Get country distribution
+    const [countryStats] = await connection.query(
+      `SELECT 
+        country,
+        COUNT(*) as count 
+      FROM user_migrations 
+      WHERE country != '' 
+      GROUP BY country 
+      ORDER BY count DESC 
+      LIMIT 10`
+    );
+
+    // Get migration trend (last 30 days)
+    const [migrationTrend] = await connection.query(
+      `SELECT 
+        DATE(migration_date) as date,
+        COUNT(*) as count,
+        SUM(CASE WHEN success = TRUE THEN 1 ELSE 0 END) as successful
+      FROM user_migrations
+      WHERE migration_date >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+      GROUP BY DATE(migration_date)
+      ORDER BY date ASC`
+    );
+
+    res.json({
+      total: totalCount[0].total,
+      successful: successCount[0].total,
+      failed: failureCount[0].total,
+      today: todayCount[0].total,
+      emailStats: emailStats[0],
+      countryStats,
+      trend: migrationTrend
+    });
+  } catch (error) {
+    console.error('Failed to fetch migration stats:', error);
+    res.status(500).json({ error: 'Failed to fetch migration statistics' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Get recent migrations
+router.get('/recent-migrations', async (req, res) => {
+  if (!checkAdminPassphrase(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    
+    const [migrations] = await pool.query(
+      `SELECT 
+        id, 
+        user_id, 
+        user_email, 
+        migration_date, 
+        emails_migrated, 
+        emails_renamed, 
+        emails_skipped,
+        client_ip,
+        country,
+        success,
+        error_message
+      FROM user_migrations 
+      ORDER BY migration_date DESC 
+      LIMIT ?`,
+      [limit]
+    );
+    
+    res.json(migrations);
+  } catch (error) {
+    console.error('Failed to fetch recent migrations:', error);
+    res.status(500).json({ error: 'Failed to fetch recent migrations' });
+  }
+});
+
+// Lookup migration by ID
+router.get('/lookup-migration/:id', async (req, res) => {
+  if (!checkAdminPassphrase(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const [migration] = await pool.query(
+      `SELECT * FROM user_migrations WHERE id = ?`,
+      [req.params.id]
+    );
+    
+    if (migration.length === 0) {
+      return res.status(404).json({ error: 'Migration not found' });
+    }
+    
+    // Get user information
+    const [userInfo] = await pool.query(
+      'SELECT created_at, last_login FROM users WHERE id = ?',
+      [migration[0].user_id]
+    );
+    
+    // Get user's emails count
+    const [emailCount] = await pool.query(
+      'SELECT COUNT(*) as total FROM temp_emails WHERE user_id = ?',
+      [migration[0].user_id]
+    );
+    
+    res.json({
+      migration: migration[0],
+      userInfo: userInfo.length > 0 ? userInfo[0] : null,
+      emailCount: emailCount[0].total
+    });
+  } catch (error) {
+    console.error('Failed to lookup migration:', error);
+    res.status(500).json({ error: 'Failed to lookup migration' });
+  }
+});
+
 export default router;
