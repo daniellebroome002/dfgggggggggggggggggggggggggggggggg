@@ -288,11 +288,18 @@ router.post('/create', authenticateAnyToken, rateLimitMiddleware, checkCaptchaRe
     
     // Always check for captcha requirements first
     if (res.locals.captchaRequired && !captchaResponse) {
+      // Store the email creation request data in the response
       return res.status(400).json({
         error: 'CAPTCHA_REQUIRED',
         captchaRequired: true,
         captchaSiteKey: res.locals.captchaSiteKey,
-        message: 'Please complete the CAPTCHA to continue.'
+        message: 'You have reached the email limit for this hour. Please complete the CAPTCHA to continue.',
+        // Include the necessary information to resubmit the request
+        pendingEmail: {
+          email,
+          domainId,
+          expiresAt
+        }
       });
     }
     
@@ -700,7 +707,12 @@ router.post('/public/create', rateLimitMiddleware, checkCaptchaRequired, verifyC
         error: 'CAPTCHA_REQUIRED',
         captchaRequired: true,
         captchaSiteKey: res.locals.captchaSiteKey,
-        message: 'Please complete the CAPTCHA to continue.'
+        message: 'You have reached the email limit for this hour. Please complete the CAPTCHA to continue.',
+        // Include the necessary information to resubmit the request
+        pendingEmail: {
+          email,
+          domainId
+        }
       });
     }
     
