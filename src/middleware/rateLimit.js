@@ -100,8 +100,8 @@ const RATE_LIMIT = {
   WINDOW_MS: 60 * 60 * 1000, // 1 hour in milliseconds
   // Additional limits for authenticated users
   AUTH_MAX_EMAILS_PER_HOUR: 15, // Higher limit for authenticated users
-  // Threshold for showing captcha (one less than the max limit)
-  CAPTCHA_THRESHOLD: 14
+  // Show captcha exactly at the limit, not before
+  CAPTCHA_THRESHOLD: 15
 };
 
 // Rate limit middleware
@@ -127,7 +127,7 @@ export function rateLimitMiddleware(req, res, next) {
     // Increment count for this user
     rateLimitStore.userLimits[userId].count++;
     
-    // Check if user is close to rate limit - proactively enable captcha
+    // Check if rate limit is exactly at threshold or exceeded - require captcha
     if (rateLimitStore.userLimits[userId].count >= RATE_LIMIT.CAPTCHA_THRESHOLD) {
       rateLimitStore.userLimits[userId].captchaRequired = true;
     }
@@ -156,7 +156,7 @@ export function rateLimitMiddleware(req, res, next) {
   // Increment count for this IP
   rateLimitStore.limits[clientIp].count++;
   
-  // Proactively trigger captcha at threshold
+  // Require captcha exactly at threshold
   if (rateLimitStore.limits[clientIp].count >= RATE_LIMIT.CAPTCHA_THRESHOLD) {
     rateLimitStore.limits[clientIp].captchaRequired = true;
   }
@@ -196,7 +196,11 @@ export async function verifyCaptcha(req, res, next) {
   const captchaResponse = req.body.captchaResponse;
   
   if (!captchaResponse) {
-    return res.status(400).json({ error: 'CAPTCHA_REQUIRED', message: 'CAPTCHA verification required' });
+    return res.status(400).json({ 
+      error: 'CAPTCHA_REQUIRED', 
+      message: 'CAPTCHA verification required',
+      status: 'captcha_needed'
+    });
   }
   
   try {
@@ -226,14 +230,25 @@ export async function verifyCaptcha(req, res, next) {
         }
       }
       
+      // Set a flag to indicate captcha verification was successful
+      res.locals.captchaVerified = true;
+      
       // Proceed with request
       next();
     } else {
-      return res.status(400).json({ error: 'INVALID_CAPTCHA', message: 'CAPTCHA verification failed' });
+      return res.status(400).json({ 
+        error: 'INVALID_CAPTCHA', 
+        message: 'CAPTCHA verification failed',
+        status: 'captcha_failed'
+      });
     }
   } catch (error) {
     console.error('CAPTCHA verification error:', error);
-    return res.status(500).json({ error: 'CAPTCHA_ERROR', message: 'Error verifying CAPTCHA' });
+    return res.status(500).json({ 
+      error: 'CAPTCHA_ERROR', 
+      message: 'Error verifying CAPTCHA',
+      status: 'captcha_error'
+    });
   }
 }
 
