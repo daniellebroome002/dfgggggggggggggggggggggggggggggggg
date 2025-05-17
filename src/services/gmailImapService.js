@@ -17,21 +17,49 @@ const aliasToAccountMap = new Map(); // Quick lookup of alias to account
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
-const ALIAS_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds for in-memory cache
+const ALIAS_TTL = 1 * 24 * 60 * 60 * 1000; // 1 day in milliseconds for in-memory cache
 const MAX_RECONNECTION_ATTEMPTS = 5; // Maximum number of reconnection attempts
 const BASE_RECONNECTION_DELAY = 2000; // Base delay for reconnection (2 seconds)
 const MAX_RECONNECTION_DELAY = 10 * 60 * 1000; // Maximum delay (10 minutes)
 const POLLING_INTERVALS = {
-  high: 10000,     // 10 seconds for high priority accounts
-  medium: 20000,   // 20 seconds for medium priority
-  low: 30000       // 30 seconds for low priority accounts
+  high: 5000,      // 5 seconds for high priority accounts (reduced from 10s)
+  medium: 10000,   // 10 seconds for medium priority (reduced from 20s)
+  low: 15000       // 15 seconds for low priority accounts (reduced from 30s)
 };
-const CONNECTION_TIMEOUT = 30000; // 30 second timeout for IMAP connections
+const CONNECTION_TIMEOUT = 15000; // 15 second timeout for IMAP connections (reduced from 30s)
 const IDLE_TIMEOUT = 300000; // 5 minutes idle timeout (Gmail drops at ~10 min)
 const MAX_EMAILS_PER_FETCH = 50; // Maximum number of emails to fetch at once
 const DB_FLUSH_INTERVAL = 120000; // Flush DB updates every 2 minutes
-const CONNECTION_POOL_SIZE = 5; // Maximum concurrent connections per account
+const CONNECTION_POOL_SIZE = 10; // Maximum concurrent connections per account (increased from 5)
 const SEARCH_WINDOW = 14; // Number of days to search for emails
+
+// Global polling settings - NEW SYNCHRONIZED APPROACH
+const SYNC_POLLING = {
+  enabled: true,                    // Master switch for synchronized polling
+  pollingInterval: 5000,            // Poll every 5 seconds (super aggressive)
+  maxConcurrentFetches: 5,          // REDUCED from 20 to 5 to avoid "Too many connections" errors
+  fetchTimeout: 10000,              // Timeout each fetch after 10 seconds
+  checkAllFolders: true,            // Check both inbox and spam folders
+  retryFailedFetches: true,         // Retry failed fetches immediately
+  fetchAllAliasesAtOnce: true,      // Fetch for all aliases of an account at once
+  usePromiseAllSettled: true,       // Use Promise.allSettled to continue even if some fail
+  inProgress: false,                // Flag to prevent overlapping polling cycles
+  lastRunTime: 0                    // Track when polling was last run
+};
+
+// New optimized IDLE settings for MUCH faster delivery
+const IDLE_SETTINGS = {
+  enabled: false,                     // Disable IDLE mode - using synchronized polling instead
+  maxIdleAccounts: 30,                // Increased from 10 to accommodate all accounts
+  idleRestartInterval: 3 * 60 * 1000, // Restart IDLE every 3 minutes (even more aggressive)
+  idleTimeout: 10 * 60 * 1000,        // Gmail typically times out after ~29 minutes
+  useAggressiveIdle: true,            // New setting to use more aggressive IDLE
+  reconnectDelay: 500                 // Even faster reconnect on errors (500ms)
+};
+
+// Track IDLE accounts and connections
+const idleAccounts = new Set(); // Accounts with active IDLE connections
+const idleTimers = new Map();   // Timers for IDLE expiration
 
 // Setup DB flushing interval
 let dbFlushIntervalId = null;
@@ -58,7 +86,62 @@ function decrypt(text) {
   return decrypted.toString();
 }
 
-// Setup WebSocket Server
+// Utility function to notify all connected clients for an alias
+function notifyClients(alias, email) {
+  // Skip if the alias is no longer active
+  if (!isAliasActive(alias)) {
+    return;
+  }
+  
+  // Prepare notification payload once
+  const notification = {
+    type: 'new_email',
+    email,
+    alias,
+    timestamp: new Date().toISOString()
+  };
+  
+  const payload = JSON.stringify(notification);
+  let notifiedCount = 0;
+  
+  // ULTRA-FAST: Direct delivery with no extra checks
+  const clients = [];
+  
+  // Direct lookup by alias only - faster
+  for (const [clientKey, clientSet] of connectedClients.entries()) {
+    if (clientKey.includes(`:${alias}`)) {
+      clientSet.forEach(client => clients.push(client));
+    }
+  }
+  
+  // Fast batch delivery to all clients
+  if (clients.length > 0) {
+    // Use Promise.all for concurrent delivery
+    Promise.all(
+      clients
+        .filter(client => client.readyState === 1) // Only OPEN connections
+        .map(client => {
+          return new Promise(resolve => {
+            try {
+              // SPEED: Use highest priority and compression
+              client.send(payload, { 
+                binary: false, 
+                compress: true, 
+                priority: true,
+                fin: true // Ensure packet is sent immediately
+              }, () => resolve());
+              notifiedCount++;
+            } catch (err) {
+              // Silent error handling
+              resolve();
+            }
+          });
+        })
+    ).catch(() => {}); // Ignore errors in notification
+  }
+}
+
+// Setup WebSocket Server with reduced logging
 export function setupWebSocketServer(server) {
   const wss = new WebSocketServer({ 
     server,
@@ -83,13 +166,14 @@ export function setupWebSocketServer(server) {
     const alias = url.searchParams.get('alias');
     
     if (!userId || !alias) {
-      console.log('WebSocket connection rejected: missing userId or alias');
+      // Reduced log message
       ws.close();
       return;
     }
     
     const clientKey = `${userId}:${alias}`;
-    console.log(`WebSocket client connected: ${clientKey}`);
+    // Only log when debugging is needed
+    // console.log(`WebSocket client connected: ${clientKey}`);
     
     // Add to connected clients
     if (!connectedClients.has(clientKey)) {
@@ -105,17 +189,24 @@ export function setupWebSocketServer(server) {
       alias
     }));
     
-    // Trigger immediate polling for this alias to get the latest emails
+    // Trigger immediate fetch to get latest emails right away
     if (aliasToAccountMap.has(alias)) {
       const accountEmail = aliasToAccountMap.get(alias);
-      // Trigger a specific fetch for this alias (in background)
-      fetchEmailsForAlias(accountEmail, alias)
-        .catch(err => console.error(`Error in immediate fetch for ${alias}:`, err));
+      
+      // First, check if we have a direct IDLE connection for this account
+      if (idleAccounts.has(accountEmail)) {
+        // Reduced logging
+        sendCachedEmailsToClient(clientKey, alias, ws);
+      } else {
+        // Trigger a specific fetch for this alias (in background)
+        fetchEmailsForAlias(accountEmail, alias)
+          .catch(err => console.error(`Error in immediate fetch for ${alias}:`, err));
+      }
     }
     
     // Handle client disconnect
     ws.on('close', () => {
-      console.log(`WebSocket client disconnected: ${clientKey}`);
+      // Reduced logging - no need to log every disconnect
       if (connectedClients.has(clientKey)) {
         connectedClients.get(clientKey).delete(ws);
         if (connectedClients.get(clientKey).size === 0) {
@@ -136,18 +227,39 @@ export function setupWebSocketServer(server) {
             timestamp: Date.now()
           }));
         }
+        
+        // Handle explicit request to refresh emails
+        if (data.type === 'refresh_emails') {
+          if (aliasToAccountMap.has(alias)) {
+            const accountEmail = aliasToAccountMap.get(alias);
+            
+            // Send any cached emails immediately
+            sendCachedEmailsToClient(clientKey, alias, ws);
+            
+            // Also trigger a fresh fetch
+            fetchEmailsForAlias(accountEmail, alias)
+              .catch(err => console.error(`Error in refresh fetch for ${alias}:`, err));
+          }
+        }
       } catch (err) {
-        console.error('Invalid WebSocket message:', err);
+        // Only log if it's not a connection terminated error
+        if (!err.message.includes('connection') && !err.message.includes('closed')) {
+          console.error('Invalid WebSocket message:', err);
+        }
       }
     });
     
     // Handle errors
     ws.on('error', (err) => {
-      console.error(`WebSocket error for client ${clientKey}:`, err);
+      // Only log serious errors, not disconnection errors
+      if (!err.message.includes('connection') && !err.message.includes('closed')) {
+        console.error(`WebSocket error for client ${clientKey}:`, err);
+      }
+      
       try {
         ws.close();
       } catch (closeErr) {
-        console.error(`Error closing WebSocket for ${clientKey}:`, closeErr);
+        // Don't log close errors
       }
     });
   });
@@ -157,7 +269,7 @@ export function setupWebSocketServer(server) {
     console.error('WebSocket server error:', err);
   });
   
-  // Log websocket stats every 5 minutes
+  // Log websocket stats less frequently - changed from 5 minutes to 30 minutes
   setInterval(() => {
     console.log(`WebSocket stats: ${connectedClients.size} unique aliases connected`);
     let totalConnections = 0;
@@ -165,9 +277,42 @@ export function setupWebSocketServer(server) {
       totalConnections += clients.size;
     }
     console.log(`Total WebSocket connections: ${totalConnections}`);
-  }, 5 * 60 * 1000);
+  }, 30 * 60 * 1000);
   
   return wss;
+}
+
+// Send cached emails to a specific client
+function sendCachedEmailsToClient(clientKey, alias, ws) {
+  // Check if alias is still active
+  if (!isAliasActive(alias)) {
+    return;
+  }
+  
+  // Get cached emails for this alias
+  const cachedEmails = [];
+  for (const [key, email] of emailCache.entries()) {
+    if (key.startsWith(`${alias}:`)) {
+      cachedEmails.push(email);
+    }
+  }
+  
+  // Sort by date (newest first)
+  const sortedEmails = cachedEmails.sort((a, b) => 
+    new Date(b.internalDate) - new Date(a.internalDate)
+  );
+  
+  // Only send if we have emails and the connection is open
+  if (sortedEmails.length > 0 && ws.readyState === 1) {
+    // Send a batch notification with all emails
+    ws.send(JSON.stringify({
+      type: 'cached_emails',
+      emails: sortedEmails.slice(0, 20), // Limit to 20 most recent
+      count: sortedEmails.length,
+      alias,
+      timestamp: new Date().toISOString()
+    }));
+  }
 }
 
 // Start DB flush interval
@@ -265,35 +410,6 @@ function queueDatabaseUpdate(accountId, quotaIncrement = 1) {
   }
 }
 
-// Utility function to notify all connected clients for an alias
-function notifyClients(alias, email) {
-  for (const [clientKey, clients] of connectedClients.entries()) {
-    const [userId, clientAlias] = clientKey.split(':');
-    
-    if (clientAlias === alias) {
-      const notification = {
-        type: 'new_email',
-        email,
-        alias,
-        timestamp: new Date().toISOString()
-      };
-      
-      const payload = JSON.stringify(notification);
-      
-      for (const client of clients) {
-        if (client.readyState === 1) { // OPEN
-          try {
-            client.send(payload);
-            console.log(`Notified client ${clientKey} about new email`);
-          } catch (err) {
-            console.error(`Error notifying client ${clientKey}:`, err);
-          }
-        }
-      }
-    }
-  }
-}
-
 // Gmail Account Management
 export async function addGmailAccount(email, appPassword) {
   try {
@@ -359,11 +475,38 @@ export async function addGmailAccount(email, appPassword) {
         throw new Error(`Failed to connect to IMAP server: ${imapError.message}`);
       }
       
-      // Start polling for this account
+      // IMPROVED: Immediately set up IDLE for the new account
       if (!activeImapAccounts.has(email)) {
-        console.log(`Starting polling for account: ${email}`);
-        schedulePolling(email);
+        console.log(`⚡⚡ ULTRA-FAST: Setting up IMMEDIATE IDLE connection for new account: ${email}`);
+        
+        // Add to active accounts set
         activeImapAccounts.add(email);
+        
+        // Get account data with fresh copy
+        const accountData = {
+          id,
+          email,
+          app_password: encryptedPassword,
+          status: 'active'
+        };
+        
+        // Import the connection pool to set priority
+        const imapConnectionPool = (await import('./imapConnectionPool.js')).default;
+        imapConnectionPool.setAccountPriority(email, 'high');
+        
+        // Try to set up IDLE mode immediately
+        setupIdleMode(email, accountData)
+          .then(success => {
+            if (!success) {
+              // Fall back to polling only if IDLE fails
+              startTraditionalPolling(email, 'high');
+            }
+          })
+          .catch(error => {
+            console.error(`Error setting up IDLE for new account ${email}:`, error.message);
+            // Fall back to polling
+            startTraditionalPolling(email, 'high');
+          });
       }
       
       return { email, id };
@@ -649,12 +792,17 @@ function cleanupConnectionPools() {
           // Remove from pool first to prevent reuse
           pool.splice(i, 1);
           
-          // Close connection
-          conn.client.logout().catch(err => {
-            console.warn(`Error closing stale connection for ${accountEmail}:`, err);
-          });
+          // Close connection with better error handling
+          if (conn.client && typeof conn.client.logout === 'function') {
+            conn.client.logout().catch(err => {
+              // Just log the error but don't escalate it
+              if (err.code !== 'NoConnection') {
+                console.warn(`Error closing stale connection for ${accountEmail}:`, err.message);
+              }
+            });
+          }
         } catch (err) {
-          console.warn(`Error during connection cleanup for ${accountEmail}:`, err);
+          console.warn(`Error during connection cleanup for ${accountEmail}:`, err.message);
         }
       }
     }
@@ -924,6 +1072,11 @@ async function fetchEmailsForAlias(accountEmail, alias) {
   let connection = null;
   
   try {
+    // Skip if the alias is no longer in the cache
+    if (!aliasCache.has(alias)) {
+      return [];
+    }
+    
     // Get IMAP client from the connection pool
     connection = await getImapConnection(accountEmail);
     const client = connection.client;
@@ -939,15 +1092,13 @@ async function fetchEmailsForAlias(accountEmail, alias) {
     
     for (const folder of folders) {
       try {
-        console.log(`Searching ${folder} for emails to ${alias}...`);
+        // Reduced logging
         
         // Select the mailbox
         const mailbox = await client.mailboxOpen(folder);
-        console.log(`Opened ${folder} for ${accountEmail}, message count: ${mailbox.exists}`);
         
         // If no messages, skip to next folder
         if (mailbox.exists === 0) {
-          console.log(`No messages in ${folder} for ${accountEmail}`);
           continue;
         }
         
@@ -958,7 +1109,9 @@ async function fetchEmailsForAlias(accountEmail, alias) {
           since: searchDate
         });
         
-        console.log(`Found ${specificSearch.length} new messages for ${alias} in ${folder} since ${searchDate.toISOString()}`);
+        if (specificSearch.length > 0) {
+          console.log(`Found ${specificSearch.length} new messages for ${alias} in ${folder}`);
+        }
         
         if (specificSearch.length === 0) {
           // Skip processing messages for this folder if none found
@@ -973,6 +1126,11 @@ async function fetchEmailsForAlias(accountEmail, alias) {
         // Fetch email details for matching messages
         for await (const message of client.fetch(messagesToProcess, { envelope: true, source: true, uid: true })) {
           try {
+            // Skip if the alias has been removed during processing
+            if (!aliasCache.has(alias)) {
+              break;
+            }
+            
             // Parse the message
             const email = await parseImapMessage(message.source.toString(), alias);
             
@@ -987,28 +1145,26 @@ async function fetchEmailsForAlias(accountEmail, alias) {
               
               // Notify connected clients about the new email in real-time
               notifyClients(alias, email);
-              console.log(`Found and cached new email for ${alias}, UID: ${message.uid}`);
+              // Reduced logging
             }
           } catch (messageError) {
-            console.error(`Error processing message ${message.uid}:`, messageError);
+            console.error(`Error processing message: ${messageError.message}`);
           }
         }
       } catch (folderError) {
-        console.error(`Error processing folder ${folder} for ${accountEmail}:`, folderError);
+        console.error(`Error processing folder ${folder}:`, folderError.message);
         // Continue to next folder even if one fails
       }
     }
     
-    console.log(`Found ${totalEmails} new emails for ${alias}`);
-    
     if (totalEmails > 0) {
       // Update account usage metrics in database (batch update)
-      queueDatabaseUpdate(aliasCache.get(alias).parentAccountId, 1);
+      queueDatabaseUpdate(aliasCache.get(alias).parentAccountId, totalEmails);
     }
     
     return newEmails;
   } catch (error) {
-    console.error(`Error fetching emails for alias ${alias}:`, error);
+    console.error(`Error fetching emails for alias ${alias}:`, error.message);
     throw error;
   } finally {
     // Always release the connection back to the pool
@@ -1117,8 +1273,43 @@ export async function getUserAliases(userId) {
 // Rotate to a new alias for user
 export async function rotateUserAlias(userId, strategy = 'dot', domain = 'gmail.com') {
   try {
+    // Get the user's current alias before generating a new one
+    const oldAliases = await getUserAliases(userId);
+    
     // Generate a new alias for the user (will use load balancing)
-    return await generateGmailAlias(userId, strategy, domain);
+    const result = await generateGmailAlias(userId, strategy, domain);
+    
+    // Immediately cleanup old aliases - this is the key improvement
+    if (oldAliases && oldAliases.length > 0) {
+      for (const oldAlias of oldAliases) {
+        // Skip if it's the same as the new alias (shouldn't happen)
+        if (oldAlias === result.alias) continue;
+        
+        // Get parent account ID before removing from cache
+        let parentAccountId = null;
+        if (aliasCache.has(oldAlias)) {
+          parentAccountId = aliasCache.get(oldAlias).parentAccountId;
+        }
+        
+        // Remove old alias from caches immediately
+        aliasCache.delete(oldAlias);
+        aliasToAccountMap.delete(oldAlias);
+        
+        // Update alias count in database if we have parent account info
+        if (parentAccountId) {
+          try {
+            await pool.query(
+              'UPDATE gmail_accounts SET alias_count = GREATEST(0, alias_count - 1), updated_at = NOW() WHERE id = ?',
+              [parentAccountId]
+            );
+          } catch (error) {
+            // Don't log this error to reduce noise
+          }
+        }
+      }
+    }
+    
+    return result;
   } catch (error) {
     console.error('Failed to rotate Gmail alias:', error);
     throw error;
@@ -1250,10 +1441,10 @@ async function pollForNewEmails(accountEmail) {
       console.log(`Found ${totalNewEmails} new emails total for account ${accountEmail}`);
       
       // Update account metrics in database (batch update)
-      queueDatabaseUpdate(account.id, 1);
+      queueDatabaseUpdate(account.id, totalNewEmails);
     }
   } catch (error) {
-    console.error(`Error polling Gmail account ${accountEmail}:`, error);
+    console.error(`Error polling Gmail account ${accountEmail}:`, error.message);
     
     // Update account status in database with more detailed status
     let statusUpdate = 'error';
@@ -1261,7 +1452,6 @@ async function pollForNewEmails(accountEmail) {
         error.message?.includes('authentication failed') ||
         error.message?.includes('[AUTH]')) {
       statusUpdate = 'auth-error';
-      console.log(`Account ${accountEmail} has invalid credentials - marked as auth-error`);
       
       try {
         await pool.query(
@@ -1269,7 +1459,7 @@ async function pollForNewEmails(accountEmail) {
           [statusUpdate, accountEmail]
         );
       } catch (dbError) {
-        console.error(`Error updating status for ${accountEmail}:`, dbError);
+        console.error(`Error updating status for ${accountEmail}:`, dbError.message);
       }
       
       // Remove from active polling immediately
@@ -1285,7 +1475,10 @@ async function pollForNewEmails(accountEmail) {
       try {
         connection.release();
       } catch (releaseError) {
-        console.warn(`Error releasing connection for ${accountEmail}:`, releaseError);
+        // Ignore NoConnection errors during release
+        if (releaseError.code !== 'NoConnection') {
+          console.warn(`Error releasing connection for ${accountEmail}:`, releaseError.message);
+        }
       }
     }
   }
@@ -1327,68 +1520,491 @@ function handlePollingError(accountEmail, error) {
 
 // Schedule polling for an account
 function schedulePolling(accountEmail) {
-  console.log(`Setting up polling schedule for ${accountEmail}`);
-  
-  // Self-executing async function to check account and set up polling
   (async () => {
     try {
-      // Get latest account state from database
+      // Get account data
       const [accounts] = await pool.query(
         'SELECT * FROM gmail_accounts WHERE email = ?',
         [accountEmail]
       );
       
-      if (accounts.length === 0) {
-        console.log(`Not scheduling polling for missing account: ${accountEmail}`);
+      if (accounts.length === 0 || accounts[0].status !== 'active') {
         activeImapAccounts.delete(accountEmail);
         return;
       }
       
-      const accountStatus = accounts[0].status;
-      if (accountStatus !== 'active') {
-        console.log(`Not scheduling polling for inactive account (${accountStatus}): ${accountEmail}`);
-        activeImapAccounts.delete(accountEmail);
-        return;
-      }
-      
-      console.log(`Scheduling polling for ${accountEmail}`);
-      
-      // Determine polling interval based on activity
-      let interval = POLLING_INTERVALS.medium; // Default to medium priority
-      
-      if (accounts[0].alias_count > 10) {
-        interval = POLLING_INTERVALS.high;
-      } else if (accounts[0].alias_count > 5) {
-        interval = POLLING_INTERVALS.medium;
-      } else {
-        interval = POLLING_INTERVALS.low;
-      }
-      
-      console.log(`Using polling interval of ${interval}ms for ${accountEmail}`);
-      
-      // Add to active accounts set
+      // Add to active accounts
       activeImapAccounts.add(accountEmail);
       
-      // Start immediate polling
-      pollForNewEmails(accountEmail).catch(error => {
-        console.error(`Initial poll for ${accountEmail} failed:`, error);
-      });
-      
-      // Schedule next poll
-      setTimeout(() => {
-        // Only schedule next poll if account is still in active set
-        if (activeImapAccounts.has(accountEmail)) {
-          schedulePolling(accountEmail);
-        } else {
-          console.log(`Stopped polling for ${accountEmail} as it's no longer in active set`);
-        }
-      }, interval);
-      
+      // ALWAYS try IDLE first - it's much faster than polling
+      // Force IDLE mode for all accounts to maximize email delivery speed
+      setupIdleMode(accountEmail, accounts[0])
+        .then(success => {
+          if (!success) {
+            // Only if IDLE fails, use traditional polling
+            startTraditionalPolling(accountEmail, 'high');
+          }
+        })
+        .catch(error => {
+          console.error(`IDLE setup error: ${error.message}`);
+          startTraditionalPolling(accountEmail, 'high');
+        });
     } catch (error) {
-      console.error(`Error setting up polling for ${accountEmail}:`, error);
+      console.error(`Polling schedule error: ${error.message}`);
     }
   })();
 }
+
+// Start traditional polling interval
+function startTraditionalPolling(accountEmail, priority = 'medium') {
+  console.log(`Using traditional polling for ${accountEmail} with priority ${priority}`);
+  
+  // Get polling interval based on priority
+  const interval = POLLING_INTERVALS[priority] || POLLING_INTERVALS.medium;
+  
+  console.log(`Using polling interval of ${interval}ms for ${accountEmail}`);
+  
+  // Start immediate polling
+  pollForNewEmails(accountEmail).catch(error => {
+    console.error(`Initial poll for ${accountEmail} failed:`, error);
+  });
+  
+  // Schedule next poll
+  setTimeout(() => {
+    // Only schedule next poll if account is still in active set
+    if (activeImapAccounts.has(accountEmail)) {
+      schedulePolling(accountEmail);
+    } else {
+      console.log(`Stopped polling for ${accountEmail} as it's no longer in active set`);
+    }
+  }, interval);
+}
+
+// Setup IDLE mode for an account for real-time updates
+async function setupIdleMode(accountEmail, accountData) {
+  if (idleAccounts.has(accountEmail)) {
+    return true;
+  }
+  
+  try {
+    // Import connection pool
+    const imapConnectionPool = (await import('./imapConnectionPool.js')).default;
+    
+    // Get app password
+    const appPassword = decrypt(accountData.app_password);
+    
+    // Set to highest priority and get dedicated connection
+    imapConnectionPool.setAccountPriority(accountEmail, 'high'); // Always use high priority
+    const client = await imapConnectionPool.getConnection(accountEmail, appPassword, true);
+    
+    // Select INBOX with readOnly to reduce overhead
+    await client.mailboxOpen('INBOX', {readOnly: true});
+    
+    // Set up aggressive IDLE restart timer - shorter interval for faster recovery
+    const idleTimer = setTimeout(() => {
+      restartIdleMode(accountEmail, accountData);
+    }, IDLE_SETTINGS.idleRestartInterval);
+    
+    idleTimers.set(accountEmail, idleTimer);
+    
+    // Set up enhanced IDLE notification handler
+    client.on('exists', async (data) => {
+      // Process new emails IMMEDIATELY
+      console.log(`⚡ IDLE notification received from Gmail - processing instantly`);
+      processNewIdleEmails(accountEmail, client, data.count).catch(err => {
+        console.error(`IDLE notification processing error: ${err.message}`);
+      });
+    });
+    
+    // Better error recovery
+    client.on('close', () => {
+      cleanupIdleMode(accountEmail);
+      
+      // IMMEDIATE restart on close for fastest possible recovery
+      setTimeout(() => {
+        restartIdleMode(accountEmail, accountData);
+      }, 100); // Reduced from 500ms to 100ms for even faster recovery
+    });
+    
+    client.on('error', (err) => {
+      cleanupIdleMode(accountEmail);
+      
+      // Fast error recovery - we want emails ASAP
+      setTimeout(() => {
+        restartIdleMode(accountEmail, accountData);
+      }, IDLE_SETTINGS.reconnectDelay); 
+    });
+    
+    // Add to active IDLE accounts
+    idleAccounts.add(accountEmail);
+    imapClients.set(accountEmail, client);
+    
+    // Immediate process of any existing emails
+    processNewIdleEmails(accountEmail, client, 10).catch(err => {
+      console.error(`Initial IDLE email error: ${err.message}`);
+    });
+    
+    return true;
+    } catch (error) {
+    cleanupIdleMode(accountEmail);
+    console.error(`IDLE setup error: ${error.message}`);
+    
+    // Fast retry on failure - don't give up
+    setTimeout(() => {
+      console.log(`Retrying IDLE setup after failure`);
+      setupIdleMode(accountEmail, accountData).catch(() => {});
+    }, 1000); // Reduced from 2000ms to 1000ms
+    
+    return false;
+  }
+}
+
+// Restart IDLE mode for an account
+async function restartIdleMode(accountEmail, accountData) {
+  console.log(`Restarting IDLE mode for ${accountEmail}`);
+  
+  // Clean up existing IDLE resources
+  cleanupIdleMode(accountEmail);
+  
+  // Wait a short time before restarting
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  
+  // Setup IDLE again
+  return setupIdleMode(accountEmail, accountData);
+}
+
+// Clean up IDLE resources
+function cleanupIdleMode(accountEmail) {
+  console.log(`Cleaning up IDLE resources for ${accountEmail}`);
+  
+  // Clear expiration timer
+  if (idleTimers.has(accountEmail)) {
+    clearTimeout(idleTimers.get(accountEmail));
+    idleTimers.delete(accountEmail);
+  }
+  
+  // Remove from active IDLE accounts
+  idleAccounts.delete(accountEmail);
+}
+
+// Much faster email processing - optimized for speed
+async function processNewIdleEmails(accountEmail, client, count) {
+  try {
+    // Get all aliases associated with this account
+    const accountAliases = [];
+    for (const [alias, data] of aliasCache.entries()) {
+      if (data.parentAccount === accountEmail) {
+        accountAliases.push(alias);
+      }
+    }
+    
+    if (accountAliases.length === 0) return;
+    
+    // Get latest message count
+    const mailbox = client.mailbox;
+    if (!mailbox || mailbox.exists === 0) return;
+    
+    // ULTRA-FAST: Always fetch more messages for better reliability
+    const fetchCount = Math.max(count || 10, 15); // Increased from 5/10 to 10/15
+    
+    // Calculate range (newest emails)
+    const from = Math.max(mailbox.exists - fetchCount + 1, 1);
+    const to = mailbox.exists;
+    
+    console.log(`⚡⚡ ULTRA-FAST: Fetching newest ${fetchCount} messages (${from}-${to}) via IDLE notification`);
+    
+    // CRITICAL CHANGE: Fetch ALL newest messages first, then process them
+    // This gets the messages from Gmail as fast as possible
+    const messages = [];
+    
+    try {
+      // PERFORMANCE: Fetch messages in parallel with a Promise-based approach
+      const fetchPromise = new Promise((resolve, reject) => {
+        const fetchedMessages = [];
+        
+        const fetchStream = client.fetch(`${from}:${to}`, 
+          { envelope: true, source: true, uid: true, flags: true });
+        
+        fetchStream.on('error', (err) => reject(err));
+        
+        fetchStream.on('end', () => resolve(fetchedMessages));
+        
+        fetchStream.on('message', (message) => {
+          fetchedMessages.push(message);
+        });
+      });
+      
+      // Set a timeout to ensure we don't wait too long (3 seconds max)
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Fetch timeout')), 3000);
+      });
+      
+      // Use Promise.race to either get messages or timeout
+      const result = await Promise.race([fetchPromise, timeoutPromise]);
+      messages.push(...result);
+      
+    } catch (fetchError) {
+      console.error(`Error fetching messages: ${fetchError.message}`);
+      return;
+    }
+    
+    if (messages.length === 0) return;
+    console.log(`⚡⚡ ULTRA-FAST: Retrieved ${messages.length} new messages to process`);
+    
+    // Now process the fetched messages for each alias
+    let deliveredCount = 0;
+    
+    // Process in parallel for maximum speed
+    await Promise.all(messages.map(async (message) => {
+      try {
+        // Check recipient addresses to match our aliases
+        const recipients = [];
+        
+        // Check all possible recipient fields
+        if (message.envelope && message.envelope.to) {
+          recipients.push(...message.envelope.to.map(r => r.address));
+        }
+        if (message.envelope && message.envelope.cc) {
+          recipients.push(...message.envelope.cc.map(r => r.address));
+        }
+        if (message.envelope && message.envelope.bcc) {
+          recipients.push(...message.envelope.bcc.map(r => r.address));
+        }
+        
+        // Find matching aliases
+        const matchingAliases = accountAliases.filter(alias => 
+          recipients.some(recipient => 
+            recipient.toLowerCase() === alias.toLowerCase())
+        );
+        
+        // Process for each matching alias in parallel
+        await Promise.all(matchingAliases.map(async (alias) => {
+          // Skip if alias no longer active
+          if (!isAliasActive(alias)) return;
+          
+          // Parse the message
+          const email = await parseImapMessage(message.source.toString(), alias);
+          
+          // Add to cache
+          const cacheKey = `${alias}:${message.uid}`;
+          
+          // Only add if not already in cache
+          if (!emailCache.has(cacheKey)) {
+            addToEmailCache(cacheKey, email);
+            deliveredCount++;
+            
+            // IMMEDIATE notification to connected clients
+            notifyClients(alias, email);
+            
+            // Update account metrics
+            if (aliasCache.has(alias)) {
+              queueDatabaseUpdate(aliasCache.get(alias).parentAccountId, 1);
+            }
+          }
+        }));
+      } catch (messageError) {
+        console.error(`Error processing message: ${messageError.message}`);
+      }
+    }));
+    
+    if (deliveredCount > 0) {
+      console.log(`⚡⚡ ULTRA-FAST: Delivered ${deliveredCount} new emails to clients`);
+    }
+  } catch (error) {
+    console.error(`IDLE processing error: ${error.message}`);
+    throw error; // Rethrow for proper handling
+  }
+}
+
+// Monitor account health
+async function monitorAccountHealth() {
+  try {
+    console.log("Monitoring account health...");
+    
+    // Get status values from database first to determine the active status name
+    const [statusCheck] = await pool.query(`
+      SELECT DISTINCT status FROM gmail_accounts LIMIT 10
+    `);
+    
+    // Build query based on available status values
+    let activeStatusValue = "active"; // Default
+    if (statusCheck && statusCheck.length > 0) {
+      // Look for something that might represent "active" status
+      const statuses = statusCheck.map(row => row.status);
+      
+      // Try to find active status from options
+      if (statuses.includes("active")) {
+        activeStatusValue = "active";
+      } else if (statuses.includes("ACTIVE")) {
+        activeStatusValue = "ACTIVE";
+      } else if (statuses.includes("1")) {
+        activeStatusValue = "1";
+      } else if (statuses.includes("enabled")) {
+        activeStatusValue = "enabled";
+      } else if (statuses.length > 0) {
+        // Use first non-error status if no obvious active status
+        const nonErrorStatus = statuses.find(s => 
+          !s.toLowerCase().includes("error") && 
+          !s.toLowerCase().includes("disabled") &&
+          !s.toLowerCase().includes("inactive")
+        );
+        if (nonErrorStatus) {
+          activeStatusValue = nonErrorStatus;
+        }
+      }
+    }
+    
+    // IMPROVED: Get all active accounts from database to check against
+    const [allActiveAccounts] = await pool.query(
+      `SELECT * FROM gmail_accounts WHERE status = ?`,
+      [activeStatusValue]
+    );
+    
+    // Create a set of all active account emails for fast lookups
+    const activeAccountEmails = new Set(allActiveAccounts.map(account => account.email));
+    
+    // First part: Check active account status and remove inactive ones
+    for (const accountEmail of activeImapAccounts) {
+      // If account is no longer in active accounts list, remove it
+      if (!activeAccountEmails.has(accountEmail)) {
+        console.log(`Account ${accountEmail} no longer active in database, removing from active accounts`);
+        activeImapAccounts.delete(accountEmail);
+        cleanupIdleMode(accountEmail);
+        continue;
+      }
+      
+      // Check if account is not in IDLE mode but should be
+      if (IDLE_SETTINGS.enabled && !idleAccounts.has(accountEmail)) {
+        // Get account data
+        const accountData = allActiveAccounts.find(a => a.email === accountEmail);
+        
+        if (accountData) {
+          console.log(`⚡⚡ Account ${accountEmail} not in IDLE mode - setting up IDLE immediately!`);
+          setupIdleMode(accountEmail, accountData)
+            .catch(err => console.error(`Error setting up IDLE: ${err.message}`));
+        }
+      }
+    }
+    
+    // Second part: Start IDLE for any active accounts that aren't being handled
+    const setupPromises = [];
+    
+    for (const account of allActiveAccounts) {
+      if (!activeImapAccounts.has(account.email)) {
+        console.log(`⚡⚡ Found active account ${account.email} not being monitored - setting up now!`);
+        
+        // Add to active accounts
+        activeImapAccounts.add(account.email);
+        
+        // Create a promise to set up IDLE
+        const setupPromise = new Promise(async (resolve) => {
+          try {
+            // Try IDLE mode first (preferred for speed)
+            const success = await setupIdleMode(account.email, account);
+            
+            if (!success) {
+              // Fall back to polling if IDLE fails
+              startTraditionalPolling(account.email, 'high');
+            }
+          } catch (error) {
+            console.error(`Error setting up account ${account.email}:`, error.message);
+            
+            // Fall back to polling
+            startTraditionalPolling(account.email, 'high');
+          } finally {
+            resolve(); // Always resolve to allow other setup to continue
+          }
+        });
+        
+        setupPromises.push(setupPromise);
+      }
+    }
+    
+    // Wait for all setup operations to complete (if any)
+    if (setupPromises.length > 0) {
+      console.log(`Setting up ${setupPromises.length} missing accounts in parallel`);
+      await Promise.all(setupPromises);
+    }
+    
+    // Log IDLE status
+    console.log(`IDLE mode status: ${idleAccounts.size}/${activeImapAccounts.size} accounts using IDLE`);
+    
+  } catch (error) {
+    console.error("Error monitoring account health:", error.message);
+  }
+}
+
+// Initialize the service by loading accounts from the database
+export async function initializeImapService() {
+  try {
+    console.log('Initializing IMAP service with SYNCHRONIZED POLLING - connecting to ALL accounts...');
+    
+    // Ensure we start the DB flush interval
+    startDbFlushInterval();
+    
+    // First check what status values exist in the database
+    const [statusCheck] = await pool.query(`
+      SELECT DISTINCT status FROM gmail_accounts LIMIT 10
+    `);
+    
+    // Determine which status value means "active"
+    let activeStatusValue = "active"; // Default
+    if (statusCheck && statusCheck.length > 0) {
+      // Look for something that might represent "active" status
+      const statuses = statusCheck.map(row => row.status);
+      console.log("Available account status values:", statuses);
+      
+      if (statuses.includes("active")) {
+        activeStatusValue = "active";
+      } else if (statuses.includes("ACTIVE")) {
+        activeStatusValue = "ACTIVE";
+      } else if (statuses.includes("1")) {
+        activeStatusValue = "1";
+      } else if (statuses.includes("enabled")) {
+        activeStatusValue = "enabled";
+      } else if (statuses.length > 0) {
+        // Try to find a non-error status
+        const nonErrorStatus = statuses.find(s => 
+          !s.toLowerCase().includes("error") && 
+          !s.toLowerCase().includes("disabled") &&
+          !s.toLowerCase().includes("inactive")
+        );
+        if (nonErrorStatus) {
+          activeStatusValue = nonErrorStatus;
+        }
+      }
+    }
+    
+    // Get all active accounts from the database
+    const [accounts] = await pool.query(`
+      SELECT * FROM gmail_accounts WHERE status = ?
+    `, [activeStatusValue]);
+    
+    console.log(`Found ${accounts.length} active Gmail accounts - adding ALL to active accounts list`);
+    
+    // Simply add all accounts to the active set
+    for (const account of accounts) {
+      activeImapAccounts.add(account.email);
+    }
+    
+    // Start synchronized polling immediately
+    if (SYNC_POLLING.enabled) {
+      console.log('Starting synchronized polling system...');
+      startSynchronizedPolling();
+    }
+    
+    // Set up an interval to check for account health
+    setInterval(monitorAccountHealth, 5 * 60 * 1000); // Every 5 minutes
+    
+    console.log('IMAP service initialized successfully with SYNCHRONIZED POLLING');
+    return true;
+  } catch (error) {
+    console.error('Failed to initialize IMAP service:', error.message);
+    return false;
+  }
+}
+
+// Improved: Schedule polling has been replaced with synchronized polling for ALL accounts
 
 // Cache Management with improved efficiency
 function addToEmailCache(key, email) {
@@ -1410,10 +2026,107 @@ function addToEmailCache(key, email) {
   });
 }
 
-// Cleanup and maintenance
+// Run optimization checks at regular intervals
+setInterval(optimizeResources, 10 * 60 * 1000); // Run every 10 minutes
+
+// Resource optimization function to manage IMAP resources efficiently
+async function optimizeResources() {
+  try {
+    // Count active aliases per account to determine needed resources
+    const accountAliasCount = new Map();
+    const activeAliases = new Set();
+    
+    // Build a map of account -> active alias count
+    for (const [alias, data] of aliasCache.entries()) {
+      // Skip aliases with no parent account
+      if (!data.parentAccount) continue;
+      
+      // Add to active aliases set for quick lookup
+      activeAliases.add(alias);
+      
+      // Count for the parent account
+      const parentAccount = data.parentAccount;
+      accountAliasCount.set(
+        parentAccount, 
+        (accountAliasCount.get(parentAccount) || 0) + 1
+      );
+    }
+    
+    // For accounts with no active aliases, remove from active accounts set
+    const accountsToRemove = [];
+    for (const accountEmail of activeImapAccounts) {
+      if (!accountAliasCount.has(accountEmail) || accountAliasCount.get(accountEmail) === 0) {
+        accountsToRemove.push(accountEmail);
+      }
+    }
+    
+    // Remove inactive accounts from polling/IDLE
+    for (const accountEmail of accountsToRemove) {
+      console.log(`Removing inactive account from polling: ${accountEmail}`);
+      activeImapAccounts.delete(accountEmail);
+      cleanupIdleMode(accountEmail);
+    }
+    
+    // Remove alias associations that are orphaned in the lookup map
+    for (const [alias, accountEmail] of aliasToAccountMap.entries()) {
+      if (!activeAliases.has(alias)) {
+        aliasToAccountMap.delete(alias);
+      }
+    }
+    
+    // Prune email cache of items for inactive aliases
+    const emailsToRemove = [];
+    for (const key of emailCache.keys()) {
+      const [alias] = key.split(':');
+      if (!activeAliases.has(alias)) {
+        emailsToRemove.push(key);
+      }
+    }
+    
+    if (emailsToRemove.length > 0) {
+      console.log(`Removing ${emailsToRemove.length} emails for inactive aliases`);
+      for (const key of emailsToRemove) {
+        emailCache.delete(key);
+      }
+    }
+    
+    // Clean up connection pools for accounts with no active aliases
+    for (const [accountEmail, pool] of connectionPools.entries()) {
+      if (!accountAliasCount.has(accountEmail) || accountAliasCount.get(accountEmail) === 0) {
+        console.log(`Closing connections for inactive account: ${accountEmail}`);
+        
+        // Close all connections in the pool
+        for (const conn of pool) {
+          try {
+            await conn.client.logout();
+          } catch (err) {
+            // Ignore errors during cleanup
+          }
+        }
+        
+        // Remove the pool
+        connectionPools.delete(accountEmail);
+      }
+    }
+    
+    // Optimize IDLE connections - ensure only accounts with active aliases use IDLE
+    for (const idleAccount of idleAccounts) {
+      if (!accountAliasCount.has(idleAccount) || accountAliasCount.get(idleAccount) === 0) {
+        console.log(`Removing IDLE for account with no active aliases: ${idleAccount}`);
+        cleanupIdleMode(idleAccount);
+      }
+    }
+    
+    // Log optimization stats
+    console.log(`Resource optimization: ${activeAliases.size} active aliases across ${accountAliasCount.size} accounts`);
+    
+  } catch (error) {
+    console.error(`Error during resource optimization: ${error.message}`);
+  }
+}
+
+// Enhanced cleanup for inactive aliases - now more aggressive
 export async function cleanupInactiveAliases() {
-  console.log('Running in-memory alias cleanup...');
-  
   // Clean up in-memory cache
   const now = Date.now();
   let inMemoryCleanupCount = 0;
@@ -1422,55 +2135,70 @@ export async function cleanupInactiveAliases() {
   try {
     await connection.beginTransaction();
     
+    // Identify aliases to remove
+    const aliasesToRemove = [];
+    
     for (const [alias, data] of aliasCache.entries()) {
       if (now - data.lastAccessed > ALIAS_TTL) {
-        // Also keep track of account aliases to update count in DB
-        if (data.parentAccountId) {
-          try {
-            // Decrement alias count in the database
-            await connection.query(
-              'UPDATE gmail_accounts SET alias_count = GREATEST(0, alias_count - 1), updated_at = NOW() WHERE id = ?',
-              [data.parentAccountId]
-            );
-          } catch (error) {
-            console.error(`Error updating alias count for account ${data.parentAccountId}:`, error);
-          }
-        }
-        
-        aliasCache.delete(alias);
-        aliasToAccountMap.delete(alias);
-        inMemoryCleanupCount++;
+        aliasesToRemove.push({
+          alias,
+          parentAccountId: data.parentAccountId
+        });
       }
+    }
+    
+    // Process all alias removals
+    for (const { alias, parentAccountId } of aliasesToRemove) {
+      // Update database if we have parent account info
+      if (parentAccountId) {
+        try {
+          // Decrement alias count in the database
+          await connection.query(
+            'UPDATE gmail_accounts SET alias_count = GREATEST(0, alias_count - 1), updated_at = NOW() WHERE id = ?',
+            [parentAccountId]
+          );
+        } catch (error) {
+          // Continue cleanup even if DB update fails
+        }
+      }
+      
+      // Remove from caches
+      aliasCache.delete(alias);
+      aliasToAccountMap.delete(alias);
+      inMemoryCleanupCount++;
     }
     
     await connection.commit();
     
     if (inMemoryCleanupCount > 0) {
-      console.log(`Cleaned up ${inMemoryCleanupCount} inactive aliases from memory cache`);
+      console.log(`Cleaned up ${inMemoryCleanupCount} inactive aliases`);
+      
+      // Run immediate resource optimization after cleaning up aliases
+      optimizeResources().catch(err => console.error(`Failed to optimize resources: ${err.message}`));
     }
     
-    // Also clean up email cache if it's getting too big
-    if (emailCache.size > MAX_CACHE_SIZE * 0.9) {
+    // Clean email cache if it's getting too big
+    if (emailCache.size > MAX_CACHE_SIZE * 0.8) {
       const oldestKeys = [...emailCache.keys()]
         .map(k => ({ key: k, timestamp: emailCache.get(k).timestamp }))
         .sort((a, b) => a.timestamp - b.timestamp)
-        .slice(0, Math.ceil(MAX_CACHE_SIZE * 0.3)) // Remove oldest 30% when we're getting full
+        .slice(0, Math.ceil(MAX_CACHE_SIZE * 0.3))
         .map(item => item.key);
       
       oldestKeys.forEach(key => emailCache.delete(key));
-      console.log(`Cleaned up ${oldestKeys.length} older emails from cache`);
+      console.log(`Cleaned up ${oldestKeys.length} old emails from cache`);
     }
     
   } catch (error) {
     await connection.rollback();
-    console.error('Error during alias cleanup:', error);
+    console.error(`Error during alias cleanup: ${error.message}`);
   } finally {
     connection.release();
   }
 }
 
-// Run alias cleanup every hour
-setInterval(cleanupInactiveAliases, 60 * 60 * 1000);
+// Run alias cleanup every 30 minutes instead of every hour
+setInterval(cleanupInactiveAliases, 30 * 60 * 1000);
 
 // Function to check for Gmail accounts that need polling restart
 export async function checkAndRestartPolling() {
@@ -1545,61 +2273,69 @@ setInterval(async () => {
 // Load Balancing with improved account selection and rotation
 async function getNextAvailableAccount() {
   try {
-    // Get available accounts with balancing strategy
+    // First get available status values
+    const [statusCheck] = await pool.query(`
+      SELECT DISTINCT status FROM gmail_accounts LIMIT 10
+    `);
+    
+    // Determine active status value
+    let activeStatusValue = "active"; // Default
+    if (statusCheck && statusCheck.length > 0) {
+      const statuses = statusCheck.map(row => row.status);
+      
+      if (statuses.includes("active")) {
+        activeStatusValue = "active";
+      } else if (statuses.includes("ACTIVE")) {
+        activeStatusValue = "ACTIVE";
+      } else if (statuses.includes("1")) {
+        activeStatusValue = "1";
+      } else if (statuses.includes("enabled")) {
+        activeStatusValue = "enabled";
+      } else if (statuses.length > 0) {
+        const nonErrorStatus = statuses.find(s => 
+          !s.toLowerCase().includes("error") && 
+          !s.toLowerCase().includes("disabled") &&
+          !s.toLowerCase().includes("inactive")
+        );
+        if (nonErrorStatus) {
+          activeStatusValue = nonErrorStatus;
+        }
+      }
+    }
+    
+    // Get active accounts with balancing strategy
     const [accounts] = await pool.query(`
       SELECT * 
       FROM gmail_accounts a
-      WHERE a.status = 'active' 
+      WHERE a.status = ? 
       ORDER BY 
         a.alias_count ASC,
         a.quota_used ASC,
         a.last_used ASC
-      LIMIT 15  -- Get top 15 accounts so we can rotate through them
-    `);
+      LIMIT 10  -- Reduced from 15 to focus on most available accounts
+    `, [activeStatusValue]);
     
     if (accounts.length === 0) {
       console.error('No available Gmail accounts');
-      
-      // Attempt to auto-recover accounts that haven't been updated in a while
-      const [recoveryResult] = await pool.query(`
-        UPDATE gmail_accounts 
-        SET status = 'active', updated_at = NOW() 
-        WHERE status != 'auth-error' 
-        AND updated_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)
-        LIMIT 3
-      `);
-      
-      if (recoveryResult.affectedRows > 0) {
-        console.log(`Auto-recovered ${recoveryResult.affectedRows} Gmail accounts`);
-        
-        // Try again after recovery
-        const [recoveredAccounts] = await pool.query(`
-          SELECT * FROM gmail_accounts
-          WHERE status = 'active'
-          ORDER BY alias_count ASC, quota_used ASC, last_used ASC
-          LIMIT 1
-        `);
-        
-        if (recoveredAccounts.length > 0) {
-          return recoveredAccounts[0];
-        }
-      }
-      
       return null;
     }
 
-    // Instead of always selecting the first account, select a random account from top 5
-    // to provide better load distribution
-    const randomIndex = accounts.length <= 5 ? 
+    // Prioritize accounts with existing IDLE setup to conserve resources
+    const idleAccount = accounts.find(a => idleAccounts.has(a.email));
+    if (idleAccount) {
+      console.log(`Reusing IDLE account for new alias: ${idleAccount.email}`);
+      return idleAccount;
+    }
+    
+    // Otherwise select a random account from top 3 to balance load
+    const randomIndex = accounts.length <= 3 ? 
       Math.floor(Math.random() * accounts.length) : 
-      Math.floor(Math.random() * 5); // Only choose from top 5
+      Math.floor(Math.random() * 3); // Only choose from top 3
     
     const selectedAccount = accounts[randomIndex];
-    console.log(`Selected account for new alias: ${selectedAccount.email} (aliases: ${selectedAccount.alias_count}, quota: ${selectedAccount.quota_used})`);
-    
     return selectedAccount;
   } catch (error) {
-    console.error('Error selecting next available account:', error);
+    console.error('Error selecting next available account:', error.message);
     return null;
   }
 }
@@ -1670,77 +2406,296 @@ export const stores = {
   aliasCache
 };
 
-// Initialize the service by loading accounts from the database
-export async function initializeImapService() {
-  try {
-    console.log('Initializing IMAP service...');
-    
-    // Ensure we start the DB flush interval
-    startDbFlushInterval();
-    
-    // Get all active accounts from the database
-    const [accounts] = await pool.query(`
-      SELECT * FROM gmail_accounts WHERE status = 'active'
-    `);
-    
-    console.log(`Found ${accounts.length} active Gmail accounts`);
-    
-    // Start polling for each active account
-    for (const account of accounts) {
-      if (!activeImapAccounts.has(account.email)) {
-        console.log(`Starting polling for account: ${account.email}`);
-        schedulePolling(account.email);
-        activeImapAccounts.add(account.email);
+// Check if an alias is still active (centralize this logic)
+function isAliasActive(alias) {
+  return aliasCache.has(alias) && aliasToAccountMap.has(alias);
+}
+
+// Add keepalive ping function to keep IMAP connections alive
+setInterval(sendKeepAlive, 60000); // Run every minute
+
+// Keep IMAP connections alive to prevent disconnections
+async function sendKeepAlive() {
+  // Send NOOP to all IDLE clients to keep them alive
+  for (const accountEmail of idleAccounts) {
+    const client = imapClients.get(accountEmail);
+    if (client && client.usable) {
+      try {
+        await client.noop();
+      } catch (error) {
+        if (error.code === 'NoConnection') {
+          // Connection lost - restart IDLE
+          cleanupIdleMode(accountEmail);
+          
+          // Get account info
+          try {
+            const [accounts] = await pool.query(
+              'SELECT * FROM gmail_accounts WHERE email = ?',
+              [accountEmail]
+            );
+            
+            if (accounts.length > 0) {
+              setTimeout(() => {
+                setupIdleMode(accountEmail, accounts[0]).catch(() => {});
+              }, 1000);
+            }
+          } catch (dbError) {
+            console.error(`Error getting account: ${dbError.message}`);
+          }
+        }
       }
     }
-    
-    // Set up an interval to check for account health
-    setInterval(monitorAccountHealth, 5 * 60 * 1000); // Every 5 minutes
-    
-    console.log('IMAP service initialized successfully');
-    return true;
-  } catch (error) {
-    console.error('Failed to initialize IMAP service:', error);
-    return false;
   }
 }
 
-// Monitor account health and clean up resources
-async function monitorAccountHealth() {
-  console.log('Running account health check...');
+// Start synchronized polling system
+let syncPollingTimer = null;
+
+function startSynchronizedPolling() {
+  if (syncPollingTimer) {
+    clearInterval(syncPollingTimer);
+  }
+  
+  console.log(`🔄 Starting SYNCHRONIZED polling every ${SYNC_POLLING.pollingInterval}ms`);
+  
+  // Initial immediate poll
+  runSynchronizedPolling();
+  
+  // Set up regular interval
+  syncPollingTimer = setInterval(runSynchronizedPolling, SYNC_POLLING.pollingInterval);
+}
+
+// Stop synchronized polling
+function stopSynchronizedPolling() {
+  if (syncPollingTimer) {
+    clearInterval(syncPollingTimer);
+    syncPollingTimer = null;
+    console.log('Stopped synchronized polling');
+  }
+}
+
+// Run a synchronized polling cycle
+async function runSynchronizedPolling() {
+  // Prevent overlapping runs
+  if (SYNC_POLLING.inProgress) {
+    return;
+  }
+  
+  // Check if we have active accounts
+  if (activeImapAccounts.size === 0) {
+    return;
+  }
   
   try {
-    // Check for any stale connections and clean them up
-    for (const [accountEmail, pool] of connectionPools.entries()) {
-      // Count active vs. available connections
-      const active = pool.filter(conn => !conn.available).length;
-      const available = pool.filter(conn => conn.available).length;
-      
-      console.log(`Account ${accountEmail}: ${active} active, ${available} available connections`);
-      
-      // Check if account is still active in our system
-      if (!activeImapAccounts.has(accountEmail)) {
-        console.log(`Account ${accountEmail} is no longer active, cleaning up connections`);
-        
-        // Close all connections
-        for (const conn of pool) {
-          try {
-            await conn.client.logout();
-          } catch (err) {
-            // Ignore errors during logout
-          }
+    SYNC_POLLING.inProgress = true;
+    SYNC_POLLING.lastRunTime = Date.now();
+    
+    // Get all active accounts with their aliases
+    const accountAliasMap = new Map();
+    
+    // Build the map of account -> aliases
+    for (const [alias, data] of aliasCache.entries()) {
+      if (data.parentAccount && activeImapAccounts.has(data.parentAccount)) {
+        if (!accountAliasMap.has(data.parentAccount)) {
+          accountAliasMap.set(data.parentAccount, []);
         }
-        
-        // Remove from connection pools
-        connectionPools.delete(accountEmail);
+        accountAliasMap.get(data.parentAccount).push(alias);
       }
     }
     
-    // Force a DB flush if there are pending updates
-    if (pendingDatabaseUpdates.size > 0) {
-      await flushPendingDatabaseUpdates();
+    // Skip if no accounts with aliases
+    if (accountAliasMap.size === 0) {
+      SYNC_POLLING.inProgress = false;
+      return;
     }
+    
+    // Reduced logging to prevent log spam
+    if (accountAliasMap.size > 5) {
+      console.log(`🔄 Running synchronized polling for ${accountAliasMap.size} accounts with aliases`);
+    }
+    
+    // Create fetch tasks with limit on concurrent execution
+    const fetchTasks = [];
+    const accounts = Array.from(accountAliasMap.keys());
+    
+    // Limit concurrent fetches to avoid overwhelming server
+    // CRITICAL: Reduced concurrent fetches to avoid "Too many connections" errors
+    const batchSize = Math.min(accounts.length, SYNC_POLLING.maxConcurrentFetches);
+    const accountsToProcess = accounts.slice(0, batchSize);
+    
+    // Create tasks for each account
+    for (const accountEmail of accountsToProcess) {
+      const aliases = accountAliasMap.get(accountEmail);
+      
+      // Skip accounts with no aliases
+      if (!aliases || aliases.length === 0) continue;
+      
+      // Create a fetch task with timeout
+      const fetchTask = new Promise(async (resolve) => {
+        try {
+          // Set up timeout
+          const timeoutId = setTimeout(() => {
+            console.log(`⚠️ Fetch timeout for account ${accountEmail}`);
+            resolve({ accountEmail, success: false, error: 'Timeout' });
+          }, SYNC_POLLING.fetchTimeout);
+          
+          // Run fetches for this account
+          const result = await fetchAllAliasesForAccount(accountEmail, aliases);
+          
+          // Clear timeout
+          clearTimeout(timeoutId);
+          
+          resolve({ accountEmail, success: true, result });
+          
+        } catch (error) {
+          console.error(`Error in fetch task for ${accountEmail}:`, error.message);
+          resolve({ accountEmail, success: false, error: error.message });
+        }
+      });
+      
+      fetchTasks.push(fetchTask);
+    }
+    
+    // Execute all fetch tasks in parallel with Promise.allSettled
+    const results = await Promise.allSettled(fetchTasks);
+    
+    // Process results
+    const successCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+    const failedCount = fetchTasks.length - successCount;
+    
+    if (failedCount > 0) {
+      console.log(`⚠️ ${failedCount} account fetches failed - will retry on next poll`);
+    }
+    
+    // Reduced logging for normal operation to prevent log spam
+    if (successCount > 5 || failedCount > 0) {
+      console.log(`🔄 Completed synchronized polling cycle: ${successCount}/${fetchTasks.length} successful`);
+    }
+    
   } catch (error) {
-    console.error('Error during account health check:', error);
+    console.error('Error in synchronized polling:', error.message);
+  } finally {
+    SYNC_POLLING.inProgress = false;
   }
 }
+
+// Fetch all aliases for a single account
+async function fetchAllAliasesForAccount(accountEmail, aliases) {
+  let connection = null;
+  
+  try {
+    // Get IMAP client from the connection pool
+    connection = await getImapConnection(accountEmail);
+    const client = connection.client;
+    
+    // Folders to check
+    const folders = SYNC_POLLING.checkAllFolders ? 
+      ['INBOX', '[Gmail]/Spam'] : ['INBOX'];
+    
+    let totalEmails = 0;
+    const fetchResults = [];
+    
+    // Process each folder
+    for (const folder of folders) {
+      try {
+        // Select the mailbox
+        const mailbox = await client.mailboxOpen(folder);
+        
+        // Skip empty folders
+        if (mailbox.exists === 0) continue;
+        
+        // Get search date (two weeks ago)
+        const searchDate = new Date();
+        searchDate.setDate(searchDate.getDate() - SEARCH_WINDOW);
+        
+        // Process all aliases at once for this folder
+        for (const alias of aliases) {
+          try {
+            // Search for emails for this alias
+            const searchResults = await client.search({
+              to: alias,
+              since: searchDate
+            });
+            
+            if (searchResults.length === 0) continue;
+            
+            // Get newest messages first (limit to most recent)
+            const uids = searchResults.slice().sort((a, b) => b - a);
+            const messagesToFetch = uids.slice(0, 30); // Fetch 30 most recent (increased from 10)
+            
+            // FIXED: Don't use stream events - use simple for-await loop
+            try {
+              // Fetch messages using simple for-await loop (this is safer)
+              for await (const message of client.fetch(messagesToFetch, { 
+                envelope: true, source: true, uid: true 
+              })) {
+                try {
+                  // Skip if the alias has been removed during processing
+                  if (!isAliasActive(alias)) continue;
+                  
+                  // Parse message
+                  const email = await parseImapMessage(message.source.toString(), alias);
+                  
+                  // Add to cache if not already there
+                  const cacheKey = `${alias}:${message.uid}`;
+                  
+                  if (!emailCache.has(cacheKey)) {
+                    addToEmailCache(cacheKey, email);
+                    totalEmails++;
+                    
+                    // Notify connected clients
+                    notifyClients(alias, email);
+                    
+                    fetchResults.push({
+                      alias,
+                      messageId: message.uid,
+                      folder
+                    });
+                  }
+                } catch (err) {
+                  console.error(`Error processing message: ${err.message}`);
+                }
+              }
+            } catch (fetchError) {
+              // Handle fetch errors more gracefully
+              console.error(`Error fetching messages for ${alias} in ${folder}: ${fetchError.message}`);
+              // Continue with next alias
+            }
+          } catch (aliasError) {
+            console.error(`Error processing alias ${alias}:`, aliasError.message);
+          }
+        }
+      } catch (folderError) {
+        console.error(`Error processing folder ${folder}:`, folderError.message);
+      }
+    }
+    
+    // Update account metrics if we found new emails
+    if (totalEmails > 0) {
+      console.log(`🔄 Found ${totalEmails} new emails for account ${accountEmail}`);
+      
+      // Update metrics for the account
+      const accountId = aliases
+        .filter(alias => aliasCache.has(alias))
+        .map(alias => aliasCache.get(alias).parentAccountId)
+        .find(id => id); // Get first valid ID
+        
+      if (accountId) {
+        queueDatabaseUpdate(accountId, totalEmails);
+      }
+    }
+    
+    return { totalEmails, fetchResults };
+    
+  } catch (error) {
+    console.error(`Error fetching emails for account ${accountEmail}:`, error.message);
+    throw error;
+  } finally {
+    // Always release the connection back to the pool
+    if (connection) {
+      connection.release();
+    }
+  }
+}
+
+
