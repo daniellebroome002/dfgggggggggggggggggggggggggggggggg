@@ -16,7 +16,7 @@ const pendingDatabaseUpdates = new Map(); // Batch DB updates to reduce database
 const aliasToAccountMap = new Map(); // Quick lookup of alias to account
 
 // Configuration
-const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
+const MAX_CACHE_SIZE = 1000; // Maximum number of emails to cache
 const ALIAS_TTL = 1 * 24 * 60 * 60 * 1000; // 1 day in milliseconds for in-memory cache
 const MAX_RECONNECTION_ATTEMPTS = 5; // Maximum number of reconnection attempts
 const BASE_RECONNECTION_DELAY = 2000; // Base delay for reconnection (2 seconds)
@@ -736,10 +736,38 @@ async function createImapClient(accountEmail) {
     // Setup event listeners for connection monitoring
     client.on('error', err => {
       console.error(`IMAP client error for ${accountEmail}:`, err);
+      
+      // Try to cleanup this client
+      try {
+        if (connectionPools.has(accountEmail)) {
+          const pool = connectionPools.get(accountEmail);
+          const index = pool.findIndex(conn => conn.client === client);
+          if (index >= 0) {
+            console.log(`Removing errored client from pool for ${accountEmail}`);
+            pool.splice(index, 1);
+          }
+        }
+      } catch (cleanupErr) {
+        // Ignore cleanup errors
+      }
     });
     
     client.on('close', () => {
       console.log(`IMAP connection closed for ${accountEmail}`);
+      
+      // Cleanup from connection pool if closed
+      try {
+        if (connectionPools.has(accountEmail)) {
+          const pool = connectionPools.get(accountEmail);
+          const index = pool.findIndex(conn => conn.client === client);
+          if (index >= 0) {
+            console.log(`Removing closed client from pool for ${accountEmail}`);
+            pool.splice(index, 1);
+          }
+        }
+      } catch (cleanupErr) {
+        // Ignore cleanup errors
+      }
     });
     
     client.on('end', () => {
@@ -785,8 +813,10 @@ function cleanupConnectionPools() {
     
     for (let i = pool.length - 1; i >= 0; i--) {
       const conn = pool[i];
-      if (conn.available && (now - conn.lastUsed > staleTimeout)) {
-        console.log(`Closing stale connection for ${accountEmail} (unused for ${Math.round((now - conn.lastUsed)/1000)}s)`);
+      // Check for stale connections OR problematic connections
+      if ((conn.available && (now - conn.lastUsed > staleTimeout)) || 
+          (conn.client && (conn.client._destroyed || !conn.client.usable))) {
+        console.log(`Closing problematic or stale connection for ${accountEmail}`);
         
         try {
           // Remove from pool first to prevent reuse
@@ -797,7 +827,7 @@ function cleanupConnectionPools() {
             conn.client.logout().catch(err => {
               // Just log the error but don't escalate it
               if (err.code !== 'NoConnection') {
-                console.warn(`Error closing stale connection for ${accountEmail}:`, err.message);
+                console.warn(`Error closing connection for ${accountEmail}:`, err.message);
               }
             });
           }
@@ -814,8 +844,8 @@ function cleanupConnectionPools() {
   }
 }
 
-// Run connection pool cleanup every 5 minutes
-setInterval(cleanupConnectionPools, 5 * 60 * 1000);
+// Run connection pool cleanup more frequently - every 2 minutes
+setInterval(cleanupConnectionPools, 2 * 60 * 1000);
 
 // Alias Generation with improved reliability and account rotation
 export async function generateGmailAlias(userId, strategy = 'dot', domain = 'gmail.com') {
@@ -1432,7 +1462,7 @@ async function pollForNewEmails(accountEmail) {
           }
         }
       } catch (folderError) {
-        console.error(`Error processing folder ${folder} for ${accountEmail}:`, folderError);
+        console.error(`Error processing folder ${folder} for ${accountEmail}:`, folderError.message);
         // Continue to next folder even if one fails
       }
     }
