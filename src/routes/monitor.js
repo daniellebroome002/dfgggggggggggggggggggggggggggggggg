@@ -7,6 +7,7 @@ import {
   getRecentIps
 } from '../middleware/requestTracker.js';
 import { manualCleanup } from '../utils/cleanup.js';
+import { getActivitySummary } from '../services/activityTracker.js';
 
 const router = express.Router();
 
@@ -14,6 +15,33 @@ const router = express.Router();
 const checkAdminPassphrase = (req) => {
   return req.headers['admin-access'] === process.env.ADMIN_PASSPHRASE;
 };
+
+// New endpoint for real-time activity monitoring
+router.get('/real-time-activity', async (req, res) => {
+  if (!checkAdminPassphrase(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    // Get pagination parameters from query string
+    const page = parseInt(req.query.page) || 0;
+    const limit = parseInt(req.query.limit) || 25;
+    
+    // Get filter parameters
+    const filters = {
+      ipFilter: req.query.ipFilter,
+      minRequests: req.query.minRequests ? parseInt(req.query.minRequests) : undefined,
+      userType: ['all', 'guest', 'registered'].includes(req.query.userType) ? req.query.userType : 'all'
+    };
+    
+    // Get activity data from in-memory cache with pagination and filters
+    const activityData = getActivitySummary(page, limit, filters);
+    res.json(activityData);
+  } catch (error) {
+    console.error('Failed to fetch real-time activity:', error);
+    res.status(500).json({ error: 'Failed to fetch real-time activity' });
+  }
+});
 
 // Get overall statistics
 router.get('/stats', async (req, res) => {

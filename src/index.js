@@ -7,6 +7,7 @@ import { initializeDatabase, checkDatabaseConnection, pool } from './db/init.js'
 import { cleanupOldEmails } from './utils/cleanup.js';
 import { requestTrackerMiddleware } from './middleware/requestTracker.js';
 import { checkBlockedIp } from './middleware/ipBlocker.js'; // Added import
+import { activityTrackerMiddleware } from './middleware/activityTrackerMiddleware.js'; // Add activity tracker
 import authRoutes from './routes/auth.js';
 import emailRoutes from './routes/emails.js';
 import domainRoutes from './routes/domains.js';
@@ -20,6 +21,7 @@ import guestRoutes from './routes/guest.js'; // Added Guest routes
 import nodemailer from 'nodemailer';
 import http from 'http'; // Added for WebSocket support
 import { setupWebSocketServer } from './services/gmailImapService.js'; // Added for WebSocket
+import { setupActivityTracker } from './services/activityTracker.js'; // Add activity tracker
 
 dotenv.config();
 
@@ -87,6 +89,9 @@ app.use(compression());
 
 // Add request tracking middleware
 app.use(requestTrackerMiddleware);
+
+// Add real-time activity tracking middleware
+app.use(activityTrackerMiddleware);
 
 // Apply IP blocker to all routes except monitor routes
 app.use(/^(?!\/monitor).*$/, checkBlockedIp); // Added IP blocker middleware
@@ -210,6 +215,10 @@ initializeDatabase().then(() => {
     // Setup WebSocket server for real-time email updates
     setupWebSocketServer(server);
     console.log('WebSocket server initialized for real-time email updates');
+    
+    // Setup WebSocket server for real-time activity tracking
+    setupActivityTracker(server);
+    console.log('Real-time activity tracking system initialized');
   });
 }).catch(error => {
   console.error('Failed to initialize database:', error);
