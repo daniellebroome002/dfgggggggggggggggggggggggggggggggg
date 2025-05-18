@@ -23,8 +23,22 @@ import { setupWebSocketServer } from './services/gmailImapService.js'; // Added 
 
 dotenv.config();
 
+// Add global error handlers to prevent server crashes
+process.on('uncaughtException', (error) => {
+  console.error('CRITICAL: Uncaught exception, preventing server crash:', error);
+  // Log the error but don't exit
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Promise Rejection:', reason);
+  // Log the error but don't exit
+});
+
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Configure Express to trust proxy headers (required for express-rate-limit when behind proxies)
+app.set('trust proxy', true);
 
 // Create HTTP server (instead of using app.listen)
 const server = http.createServer(app);
