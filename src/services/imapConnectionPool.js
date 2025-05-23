@@ -1,140 +1,313 @@
 import { ImapFlow } from 'imapflow';
 
 /**
- * IMAP Connection Pool Manager - OPTIMIZED FOR MAXIMUM SPEED
+ * Enhanced IMAP Connection Pool Manager
  * 
- * Handles creating, tracking, and reusing IMAP connections to Gmail accounts
- * to avoid "Too many simultaneous connections" errors.
+ * Optimized for performance, reliability and efficient connection reuse
+ * with intelligent connection management and error recovery.
  */
 class ImapConnectionPool {
   constructor() {
-    // Connection pool - key: email, value: { client, lastUsed, inUse, created }
+    // Connection pool - key: email, value: { client, lastUsed, inUse, created, health }
     this.connections = new Map();
     
-    // Ultra-fast settings - more connections for speed
-    this.maxConnectionsPerAccount = 5;
-    this.maxHighPriorityConnections = 5;
+    // Connection limits - balanced for performance and compliance
+    this.maxConnectionsPerAccount = 3;  // Reduced from 5 to be more conservative
+    this.maxTotalConnections = 30;      // Set overall connection limit
     
-    // Account priority cache (email -> priority)
-    this.accountPriorities = new Map();
+    // Connection health tracking
+    this.accountHealth = new Map();    // Track error rates and health
     
-    // Shorter connection timeout for faster recovery
-    this.connectionTimeout = 2 * 60 * 1000; // 2 minutes (reduced from 3 minutes)
+    // Shorter timeouts for better responsiveness
+    this.connectionTimeout = 90 * 1000;  // 90 seconds (reduced from 120)
+    this.operationTimeout = 30 * 1000;   // 30 seconds for operations
     
-    // Fast cleanup interval
-    this.cleanupInterval = setInterval(() => this.cleanupConnections(), 20 * 1000); // every 20 seconds (faster cleanup)
+    // Statistics
+    this.stats = {
+      totalCreated: 0,
+      totalReused: 0,
+      totalErrors: 0,
+      totalReleased: 0
+    };
     
-    console.log('⚡ IMAP Connection Pool initialized with connection limits to avoid Gmail errors');
+    // More frequent cleanup interval for better resource management
+    this.cleanupInterval = setInterval(() => this.cleanupConnections(), 15 * 1000); // every 15 seconds
+    
+    // Regular health check interval
+    this.healthCheckInterval = setInterval(() => this.performHealthCheck(), 60 * 1000); // every minute
+    
+    console.log('⚡ Enhanced IMAP Connection Pool initialized with optimized settings');
   }
   
   /**
-   * Set account priority level
+   * Track account health and error rates
    * @param {string} email - Gmail account email
-   * @param {string} priority - Priority level (high, medium, low)
+   * @param {string} status - 'success' or 'error'
+   * @param {Error} [error] - Optional error object
    */
-  setAccountPriority(email, priority) {
-    this.accountPriorities.set(email, priority);
+  trackHealth(email, status, error = null) {
+    if (!this.accountHealth.has(email)) {
+      this.accountHealth.set(email, {
+        successCount: 0,
+        errorCount: 0,
+        consecutiveErrors: 0,
+        lastError: null,
+        lastStatus: null,
+        lastUpdated: Date.now(),
+        backoffUntil: 0
+      });
+    }
+    
+    const health = this.accountHealth.get(email);
+    health.lastUpdated = Date.now();
+    health.lastStatus = status;
+    
+    if (status === 'success') {
+      health.successCount++;
+      health.consecutiveErrors = 0;
+    } else if (status === 'error') {
+      health.errorCount++;
+      health.consecutiveErrors++;
+      health.lastError = error ? error.message : 'Unknown error';
+      
+      // Implement exponential backoff for accounts with consecutive errors
+      if (health.consecutiveErrors > 3) {
+        const backoffTime = Math.min(
+          2 ** (health.consecutiveErrors - 3) * 5000, // Exponential backoff starting at 5s
+          15 * 60 * 1000 // Max 15 minutes
+        );
+        health.backoffUntil = Date.now() + backoffTime;
+      }
+    }
   }
   
   /**
-   * Get maximum connections allowed for an account based on priority
+   * Check if account is in backoff period
+   * @param {string} email - Gmail account email
+   * @returns {boolean} - Whether the account is in backoff
+   */
+  isInBackoff(email) {
+    if (!this.accountHealth.has(email)) return false;
+    return this.accountHealth.get(email).backoffUntil > Date.now();
+  }
+  
+  /**
+   * Get maximum connections allowed for an account
    * @param {string} email - Gmail account email
    * @returns {number} - Maximum connections
    */
   getMaxConnectionsForAccount(email) {
-    // Always return max priority connections for all accounts to eliminate inconsistency
-    return this.maxHighPriorityConnections;
+    // If in backoff, only allow one connection
+    if (this.isInBackoff(email)) return 1;
+    
+    // Otherwise use standard limit
+    return this.maxConnectionsPerAccount;
   }
   
   /**
-   * Get an IMAP connection for a Gmail account
+   * Get an IMAP connection for a Gmail account with improved connection sharing
+   * @param {string} email - Gmail account email
+   * @param {string} password - App password
+   * @param {boolean} forIdle - Whether this connection will be used for IDLE
+   * @param {Object} options - Additional options
+   * @returns {Promise<ImapFlow>} - IMAP client
+   */
+  async getConnection(email, password, forIdle = false, options = {}) {
+    // Check if account is in backoff period
+    if (this.isInBackoff(email) && !options.bypassBackoff) {
+      const health = this.accountHealth.get(email);
+      const remainingBackoff = Math.ceil((health.backoffUntil - Date.now()) / 1000);
+      
+      console.log(`Account ${email} is in backoff period (${remainingBackoff}s remaining). Using conservative connection approach.`);
+    }
+    
+    // IDLE connections are prioritized
+    if (forIdle) {
+      try {
+        return await this.createOrReuseConnection(email, password, true);
+      } catch (error) {
+        this.trackHealth(email, 'error', error);
+        this.stats.totalErrors++;
+        throw error;
+      }
+    }
+    
+    // Try to find an available non-idle connection
+    try {
+      const existingConnections = Array.from(this.connections.entries())
+        .filter(([key, data]) => 
+          key === email && 
+          !data.inUse && 
+          !data.forIdle &&
+          data.client && 
+          data.client.usable);
+      
+      if (existingConnections.length > 0) {
+        // Reuse existing connection
+        const [, connectionData] = existingConnections[0];
+        connectionData.inUse = true;
+        connectionData.lastUsed = Date.now();
+        this.stats.totalReused++;
+        
+        // Perform a quick check to ensure connection is really alive
+        if (options.testConnection) {
+          try {
+            await this.testConnectionAliveness(connectionData.client);
+          } catch (error) {
+            // If test fails, close and create a new connection
+            console.log(`Connection for ${email} failed aliveness test, creating new one`);
+            await this.closeConnection(email, connectionData.client);
+            return await this.createOrReuseConnection(email, password, forIdle);
+          }
+        }
+        
+        return connectionData.client;
+      }
+      
+      // If no available connection, create a new one
+      return await this.createOrReuseConnection(email, password, forIdle);
+    } catch (error) {
+      this.trackHealth(email, 'error', error);
+      this.stats.totalErrors++;
+      throw error;
+    }
+  }
+  
+  /**
+   * Create a new or reuse an existing connection
    * @param {string} email - Gmail account email
    * @param {string} password - App password
    * @param {boolean} forIdle - Whether this connection will be used for IDLE
    * @returns {Promise<ImapFlow>} - IMAP client
    */
-  async getConnection(email, password, forIdle = false) {
-    // IDLE connections get priority - create new if needed
-    if (forIdle) {
-      return await this.createConnection(email, password, true);
-    }
-    
-    // Check if we have an available connection for this account
-    if (this.connections.has(email)) {
-      const connectionData = this.connections.get(email);
+  async createOrReuseConnection(email, password, forIdle) {
+    // Check total connection count
+    if (this.connections.size >= this.maxTotalConnections) {
+      // Find and close least recently used connection
+      const connectionEntries = Array.from(this.connections.entries())
+        .filter(([, data]) => !data.inUse)
+        .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
       
-      // If the connection exists and is not in use, return it
-      if (connectionData && !connectionData.inUse && connectionData.client) {
+      if (connectionEntries.length > 0) {
+        const [oldestKey, oldestData] = connectionEntries[0];
         try {
-          // Check if connection is still alive
-          if (!connectionData.client.usable) {
-            await this.closeConnection(email);
-            return await this.createConnection(email, password, forIdle);
-          }
-          
-          // Mark as in use and update lastUsed timestamp
-          connectionData.inUse = true;
-          connectionData.lastUsed = Date.now();
-          connectionData.forIdle = forIdle;
-          this.connections.set(email, connectionData);
-          
-          return connectionData.client;
+          await this.closeConnection(oldestKey, oldestData.client);
+          console.log(`Closed oldest connection for ${oldestKey} to make room for new connection`);
         } catch (error) {
-          await this.closeConnection(email);
-          return await this.createConnection(email, password, forIdle);
+          console.error(`Error closing oldest connection: ${error.message}`);
         }
       }
+    }
+    
+    // Count existing connections for this account
+    const accountConnections = Array.from(this.connections.entries())
+      .filter(([key]) => key === email);
+    
+    const maxConnections = this.getMaxConnectionsForAccount(email);
+    
+    if (accountConnections.length >= maxConnections) {
+      // If we already have max connections, try to reuse one
+      const availableConnections = accountConnections
+        .filter(([, data]) => !data.inUse)
+        .sort((a, b) => {
+          // Prefer non-IDLE over IDLE if we need a non-IDLE connection
+          if (!forIdle) {
+            if (!a[1].forIdle && b[1].forIdle) return -1;
+            if (a[1].forIdle && !b[1].forIdle) return 1;
+          }
+          // Otherwise sort by last used
+          return a[1].lastUsed - b[1].lastUsed;
+        });
       
-      // If all connections are in use but we haven't reached max, create a new one
-      const accountConnections = Array.from(this.connections.entries())
-        .filter(([key]) => key === email);
-      
-      const maxConnections = this.getMaxConnectionsForAccount(email);
-      
-      if (accountConnections.length < maxConnections) {
-        return await this.createConnection(email, password, forIdle);
+      if (availableConnections.length > 0) {
+        const [, connectionData] = availableConnections[0];
+        connectionData.inUse = true;
+        connectionData.lastUsed = Date.now();
+        connectionData.forIdle = forIdle; // Update IDLE status
+        this.stats.totalReused++;
+        return connectionData.client;
       }
       
-      // If we've reached max connections and this is for IDLE, force a connection
+      // If all connections are in use, wait for one or close the oldest
       if (forIdle) {
-        // Close any non-IDLE connection to make room
-        const nonIdleConnections = accountConnections.filter(([_, data]) => !data.forIdle);
+        // For IDLE, prioritize closing a non-IDLE connection
+        const nonIdleConnections = accountConnections
+          .filter(([, data]) => !data.forIdle)
+          .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+        
         if (nonIdleConnections.length > 0) {
-          const [oldestKey, oldestData] = nonIdleConnections
-            .sort(([_, a], [__, b]) => a.lastUsed - b.lastUsed)[0];
+          const [oldestKey, oldestData] = nonIdleConnections[0];
+          try {
+            await this.closeConnection(oldestKey, oldestData.client);
+          } catch (error) {
+            console.error(`Error closing connection: ${error.message}`);
+          }
+        } else {
+          // If all are IDLE, close the oldest
+          const [oldestKey, oldestData] = accountConnections
+            .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
           
           try {
-            await oldestData.client.logout();
+            await this.closeConnection(oldestKey, oldestData.client);
           } catch (error) {
-            // Ignore connection errors
+            console.error(`Error closing oldest connection: ${error.message}`);
           }
-          
-          this.connections.delete(oldestKey);
-          return await this.createConnection(email, password, true);
         }
-        
-        // If all are IDLE, create a new one anyway - IDLE is critical
-        return await this.createConnection(email, password, true);
+      } else {
+        // For non-IDLE, try to wait briefly for a connection
+        try {
+          return await this.waitForAvailableConnection(email, password, forIdle);
+        } catch (error) {
+          // If waiting fails, close the oldest connection
+          const [oldestKey, oldestData] = accountConnections
+            .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
+          
+          try {
+            await this.closeConnection(oldestKey, oldestData.client);
+          } catch (error) {
+            console.error(`Error closing oldest connection: ${error.message}`);
+          }
+        }
       }
-      
-      // If we've reached max connections, wait for one to become available
-      return await this.waitForAvailableConnection(email, password, forIdle);
     }
     
-    // If no connection exists for this account, create a new one
+    // Create new connection
     return await this.createConnection(email, password, forIdle);
   }
   
   /**
-   * Create a new IMAP connection - optimized settings
+   * Test if a connection is still alive and responsive
+   * @param {ImapFlow} client - The IMAP client to test
+   * @returns {Promise<boolean>} - Whether the connection is alive
+   */
+  async testConnectionAliveness(client) {
+    try {
+      // Use noop command with a short timeout to test connection
+      await Promise.race([
+        client.noop(),
+        new Promise((_, reject) => setTimeout(() => 
+          reject(new Error('Connection test timeout')), 3000))
+      ]);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+  
+  /**
+   * Create a new IMAP connection with optimized settings
    * @param {string} email - Gmail account email
    * @param {string} password - App password
    * @param {boolean} forIdle - Whether this connection will be used for IDLE
    * @returns {Promise<ImapFlow>} - IMAP client
    */
   async createConnection(email, password, forIdle = false) {
+    // Determine if this account has had recent errors
+    const hasRecentErrors = this.accountHealth.has(email) && 
+                          this.accountHealth.get(email).consecutiveErrors > 0;
+    
     try {
-      // Create new connection with retry logic
+      // Create new connection with optimized settings
       const client = new ImapFlow({
         host: 'imap.gmail.com',
         port: 993,
@@ -144,218 +317,492 @@ class ImapConnectionPool {
           pass: password
         },
         logger: false,
-        // Performance optimized settings
         emitLogs: false,
-        disableAutoIdle: !forIdle, // Enable auto-IDLE for IDLE connections
-        timeoutConnection: 15000, // 15 second connection timeout (reduced)
-        timeoutAuth: 15000,      // 15 second auth timeout (reduced)
-        timeoutIdle: forIdle ? 20 * 60 * 1000 : 10 * 60 * 1000, // IDLE gets longer timeout
+        
+        // Connection settings - more conservative if account has had errors
+        disableAutoIdle: !forIdle,
+        timeoutConnection: hasRecentErrors ? 30000 : 15000, // 30s for problematic accounts
+        timeoutAuth: hasRecentErrors ? 30000 : 15000,
+        timeoutIdle: forIdle ? 25 * 60 * 1000 : 5 * 60 * 1000, // 25 min for IDLE, 5 min otherwise
+        
+        // TLS settings
         tls: {
           rejectUnauthorized: true,
           enableTrace: false,
           minVersion: 'TLSv1.2',
-          maxVersion: 'TLSv1.3'
+          maxVersion: 'TLSv1.3',
+          servername: 'imap.gmail.com', // Explicitly set SNI
+        },
+        
+        // Use CONDSTORE for change detection if available
+        allowCondStore: true,
+        
+        // IMAP extensions to use
+        enableCompression: true // Enable COMPRESS=DEFLATE if server supports it
+      });
+      
+      // Add custom event handlers for better error detection
+      client.on('error', (err) => {
+        console.error(`IMAP error on ${email} connection:`, err.message);
+        this.trackHealth(email, 'error', err);
+        
+        // If this is a fatal connection error, mark as unusable
+        if (err.code === 'ECONNRESET' || 
+            err.code === 'ECONNREFUSED' || 
+            err.code === 'ETIMEDOUT') {
+          const connectionData = Array.from(this.connections.entries())
+            .find(([key, data]) => key === email && data.client === client);
+            
+          if (connectionData) {
+            const [, data] = connectionData;
+            data.unusable = true;
+          }
         }
       });
       
-      // Connect to the server
-      await client.connect();
+      // Listen for successful actions to track health
+      client.on('mailboxOpen', () => {
+        this.trackHealth(email, 'success');
+      });
       
-      // Store the connection in the pool
-      this.connections.set(email, {
+      // Connect with timeout
+      await Promise.race([
+        client.connect(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Connection timeout')), hasRecentErrors ? 30000 : 20000)
+        )
+      ]);
+      
+      // Store the connection in the pool with health info
+      this.connections.set(`${email}:${Date.now()}`, {
         client,
         lastUsed: Date.now(),
         inUse: true,
         created: Date.now(),
-        forIdle
+        forIdle,
+        health: {
+          errorCount: 0,
+          successCount: 0
+        },
+        unusable: false
       });
+      
+      this.stats.totalCreated++;
+      this.trackHealth(email, 'success');
       
       return client;
     } catch (error) {
-      // Throw with clearer message
-      throw error;
+      // Track connection errors by type
+      this.stats.totalErrors++;
+      this.trackHealth(email, 'error', error);
+      
+      // Enhance the error with diagnostic info
+      const enhancedError = new Error(`IMAP connection error for ${email}: ${error.message}`);
+      enhancedError.originalError = error;
+      enhancedError.email = email;
+      
+      throw enhancedError;
     }
   }
   
   /**
-   * Release a connection back to the pool
+   * Release a connection back to the pool with health verification
    * @param {string} email - Gmail account email
    * @param {ImapFlow} client - The client to release
    */
-  releaseConnection(email, client) {
-    // Find the specific connection
-    if (this.connections.has(email)) {
-      const connectionData = this.connections.get(email);
+  async releaseConnection(email, client) {
+    // Find the specific connection entry
+    const connectionEntries = Array.from(this.connections.entries())
+      .filter(([key, data]) => 
+        key.startsWith(`${email}:`) && 
+        data.client === client);
       
-      // Only release if it's the same client object
-      if (connectionData && connectionData.client === client) {
-        // Mark as not in use and update lastUsed timestamp
-        connectionData.inUse = false;
-        connectionData.lastUsed = Date.now();
-        this.connections.set(email, connectionData);
+    if (connectionEntries.length === 0) {
+      console.warn(`Attempted to release unknown connection for ${email}`);
+      return;
+    }
+    
+    const [connectionKey, connectionData] = connectionEntries[0];
+    
+    // If connection is marked as unusable, close it
+    if (connectionData.unusable) {
+      console.log(`Closing unusable connection for ${email}`);
+      await this.closeConnection(connectionKey, client);
+      return;
+    }
+    
+    // Test if connection is still usable (for non-IDLE connections)
+    if (!connectionData.forIdle && connectionData.inUse) {
+      try {
+        // Quick check if connection is still responsive
+        const isAlive = await this.testConnectionAliveness(client);
+        
+        if (!isAlive) {
+          console.log(`Connection for ${email} failed health check, closing`);
+          await this.closeConnection(connectionKey, client);
+          return;
+        }
+      } catch (error) {
+        console.warn(`Error testing connection health: ${error.message}`);
+        await this.closeConnection(connectionKey, client);
+        return;
       }
     }
+    
+    // Mark as not in use and update lastUsed timestamp
+    connectionData.inUse = false;
+    connectionData.lastUsed = Date.now();
+    this.stats.totalReleased++;
+    
+    // Keep track of connection in the pool
+    this.connections.set(connectionKey, connectionData);
   }
   
   /**
-   * Wait for an available connection - faster timeouts
+   * Wait for an available connection with improved timeout
    * @param {string} email - Gmail account email
    * @param {string} password - App password
    * @param {boolean} forIdle - Whether this connection will be used for IDLE
    * @returns {Promise<ImapFlow>} - IMAP client
    */
   async waitForAvailableConnection(email, password, forIdle = false) {
-    return new Promise((resolve) => {
-      // Check every 100ms for an available connection (ultra-fast)
-      const checkInterval = setInterval(async () => {
-        const connections = Array.from(this.connections.entries())
-          .filter(([key, data]) => key === email && !data.inUse);
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+      let timer;
+      
+      // Check every 50ms for an available connection (faster than before)
+      const checkInterval = setInterval(() => {
+        const availableConnections = Array.from(this.connections.entries())
+          .filter(([key, data]) => 
+            key.startsWith(`${email}:`) && 
+            !data.inUse && 
+            !data.unusable &&
+            data.client && 
+            data.client.usable);
         
-        if (connections.length > 0) {
+        if (availableConnections.length > 0) {
           clearInterval(checkInterval);
+          clearTimeout(timer);
           
-          const [, connectionData] = connections[0];
+          if (resolved) return; // Prevent double resolution
+          resolved = true;
+          
+          const [connectionKey, connectionData] = availableConnections[0];
           connectionData.inUse = true;
           connectionData.lastUsed = Date.now();
           connectionData.forIdle = forIdle;
-          this.connections.set(email, connectionData);
+          this.connections.set(connectionKey, connectionData);
+          this.stats.totalReused++;
           
           resolve(connectionData.client);
         }
-      }, 100); // Ultra-fast check interval
+      }, 50); // Faster check interval
       
-      // Timeout after 3 seconds (down from 6) for faster response
-      setTimeout(async () => {
+      // Timeout after 2 seconds (reduced from 3s)
+      timer = setTimeout(() => {
         clearInterval(checkInterval);
         
-        // Force create a new connection
-        try {
-          // Try to close any old connections first
-          const accountConnections = Array.from(this.connections.entries())
-            .filter(([key]) => key === email)
-            .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
-          
-          if (accountConnections.length > 0) {
-            // Prefer closing non-IDLE connections if this is for IDLE
-            if (forIdle && accountConnections.some(([_, data]) => !data.forIdle)) {
-              const oldestNonIdle = accountConnections
-                .filter(([_, data]) => !data.forIdle)
-                .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
-                
-              await this.closeConnection(oldestNonIdle[0]);
-            } else {
-              // Otherwise close the oldest connection
-              await this.closeConnection(accountConnections[0][0]);
-            }
-          }
-          
-          // Create a new connection
-          const client = await this.createConnection(email, password, forIdle);
-          resolve(client);
-        } catch (error) {
-          throw error;
-        }
-      }, 3000); // Reduced timeout
+        if (resolved) return; // Prevent double resolution
+        resolved = true;
+        
+        // If waiting fails, try to create a new connection
+        this.createConnection(email, password, forIdle)
+          .then(client => resolve(client))
+          .catch(error => reject(error));
+      }, 2000);
     });
   }
   
   /**
-   * Close a specific connection
-   * @param {string} email - Gmail account email
+   * Close a specific connection with improved error handling
+   * @param {string} connectionKey - Connection key in the pool
+   * @param {ImapFlow} client - The client to close
    */
-  async closeConnection(email) {
-    if (this.connections.has(email)) {
-      const connectionData = this.connections.get(email);
-      
-      if (connectionData && connectionData.client) {
-        try {
-          // Better connection closing based on state with error handling
+  async closeConnection(connectionKey, client) {
+    if (!this.connections.has(connectionKey)) {
+      // If we have a client but no key, try to find it
+      if (client) {
+        const entries = Array.from(this.connections.entries())
+          .filter(([, data]) => data.client === client);
+          
+        if (entries.length > 0) {
+          connectionKey = entries[0][0];
+        } else {
+          // If we can't find the connection, try to close the client directly
           try {
-            if (connectionData.client.usable) {
-              await connectionData.client.logout();
-            } else if (connectionData.client._socket && connectionData.client._socket.writable) {
-              await connectionData.client.close();
-            }
+            if (client.usable) await client.logout();
+            else if (client._socket && client._socket.writable) await client.close();
           } catch (error) {
-            // Only log meaningful errors, not NoConnection which is expected sometimes
+            // Ignore errors, just log them
             if (error.code !== 'NoConnection') {
-              console.error(`Error closing IMAP connection:`, error.message);
+              console.warn(`Error directly closing IMAP client: ${error.message}`);
             }
           }
-        } catch (outerError) {
-          // Catch-all error handler
-          if (outerError.code !== 'NoConnection') {
-            console.error(`Outer error in connection closing:`, outerError.message);
+          return;
+        }
+      } else {
+        // No key and no client, nothing to do
+        return;
+      }
+    }
+    
+    const connectionData = this.connections.get(connectionKey);
+    if (!connectionData || !connectionData.client) {
+      this.connections.delete(connectionKey);
+      return;
+    }
+    
+    try {
+      const closePromise = new Promise(async (resolve) => {
+        try {
+          // Try graceful logout first if connection is usable
+          if (connectionData.client.usable) {
+            await connectionData.client.logout();
+          } 
+          // Fallback to force close if needed
+          else if (connectionData.client._socket && connectionData.client._socket.writable) {
+            await connectionData.client.close();
+          }
+        } catch (error) {
+          // Ignore expected errors
+          if (error.code !== 'NoConnection') {
+            console.warn(`Error during connection close: ${error.message}`);
           }
         }
-      }
+        resolve();
+      });
       
-      // Always remove from pool regardless of errors
-      this.connections.delete(email);
+      // Add timeout to prevent hanging on close
+      await Promise.race([
+        closePromise,
+        new Promise(resolve => setTimeout(resolve, 3000))
+      ]);
+    } catch (error) {
+      // Catch any unexpected errors during close
+      console.warn(`Unexpected error closing connection: ${error.message}`);
+    } finally {
+      // Always remove from pool
+      this.connections.delete(connectionKey);
     }
   }
   
   /**
-   * Clean up idle connections - more aggressive
+   * Clean up idle and old connections with improved monitoring
    */
   async cleanupConnections() {
     const now = Date.now();
-    const totalConnections = this.connections.size;
+    const totalBefore = this.connections.size;
     
-    // Skip if no connections
-    if (totalConnections === 0) return;
+    // Create a list of connections to close
+    const toClose = [];
     
-    for (const [email, connectionData] of this.connections.entries()) {
+    for (const [key, data] of this.connections.entries()) {
       // Skip connections that are in use
-      if (connectionData.inUse) continue;
+      if (data.inUse) continue;
       
-      // Skip IDLE connections that are newer than 15 minutes (reduced from 20)
-      if (connectionData.forIdle && now - connectionData.created < 15 * 60 * 1000) continue;
-      
-      // If connection is idle for too long, close it
-      if (now - connectionData.lastUsed > this.connectionTimeout) {
-        await this.closeConnection(email);
+      // Close connections marked as unusable
+      if (data.unusable) {
+        toClose.push([key, data.client]);
+        continue;
       }
-      // If connection is too old (approaching Gmail's timeouts), close it
-      else if (now - connectionData.created > 20 * 60 * 1000) { // 20 minutes (reduced from 25)
-        await this.closeConnection(email);
+      
+      // Close idle connections after timeout
+      const idleTime = now - data.lastUsed;
+      if (idleTime > this.connectionTimeout) {
+        toClose.push([key, data.client]);
+        continue;
+      }
+      
+      // Close connections that are too old (approaching Gmail's timeouts)
+      const age = now - data.created;
+      const maxAge = data.forIdle ? 25 * 60 * 1000 : 15 * 60 * 1000; // 25 min for IDLE, 15 min otherwise
+      
+      if (age > maxAge) {
+        toClose.push([key, data.client]);
+        continue;
+      }
+    }
+    
+    // Close all identified connections
+    for (const [key, client] of toClose) {
+      try {
+        await this.closeConnection(key, client);
+      } catch (error) {
+        console.error(`Error during connection cleanup: ${error.message}`);
+      }
+    }
+    
+    const closedCount = totalBefore - this.connections.size;
+    if (closedCount > 0) {
+      console.log(`Cleaned up ${closedCount} idle or old IMAP connections`);
+    }
+  }
+  
+  /**
+   * Perform health check on all connections
+   */
+  async performHealthCheck() {
+    const accountEmails = new Set();
+    
+    // Collect all unique account emails
+    for (const key of this.connections.keys()) {
+      const email = key.split(':')[0];
+      accountEmails.add(email);
+    }
+    
+    // Check health of each account
+    for (const email of accountEmails) {
+      const connectionEntries = Array.from(this.connections.entries())
+        .filter(([key]) => key.startsWith(`${email}:`));
+      
+      const activeCount = connectionEntries.filter(([, data]) => data.inUse).length;
+      const idleCount = connectionEntries.filter(([, data]) => !data.inUse).length;
+      const idleConnectionEntries = connectionEntries.filter(([, data]) => !data.inUse);
+      
+      // Test one idle connection to ensure the account is still working properly
+      if (idleConnectionEntries.length > 0) {
+        const [key, data] = idleConnectionEntries[0];
+        
+        try {
+          const isAlive = await this.testConnectionAliveness(data.client);
+          if (!isAlive) {
+            console.log(`Health check: Connection for ${email} failed, closing`);
+            await this.closeConnection(key, data.client);
+          }
+        } catch (error) {
+          console.warn(`Health check error for ${email}: ${error.message}`);
+        }
+      }
+      
+      // Log account status
+      if (this.accountHealth.has(email)) {
+        const health = this.accountHealth.get(email);
+        if (health.consecutiveErrors > 0) {
+          console.log(`Account ${email} health: ${health.consecutiveErrors} consecutive errors, ${activeCount} active, ${idleCount} idle connections`);
+        }
       }
     }
   }
   
   /**
-   * Get connection stats for monitoring
+   * Get detailed connection stats for monitoring
+   * @returns {Object} - Connection statistics
    */
   getStats() {
+    const now = Date.now();
     const stats = {
       totalConnections: this.connections.size,
-      accountsWithConnections: 0,
+      accountsWithConnections: new Set(
+        Array.from(this.connections.keys()).map(key => key.split(':')[0])
+      ).size,
+      inUseConnections: 0,
+      idleConnections: 0,
+      idleConnections: Array.from(this.connections.values())
+        .filter(data => !data.inUse).length,
+      connectionsByAge: {
+        lessThan1Min: 0,
+        lessThan5Min: 0,
+        lessThan15Min: 0,
+        moreThan15Min: 0
+      },
+      idleConnectionsByTime: {
+        lessThan30s: 0,
+        lessThan1Min: 0,
+        lessThan2Min: 0,
+        moreThan2Min: 0
+      },
       connectionsPerAccount: {},
-      idleConnections: 0
+      errorRates: {},
+      performance: this.stats
     };
     
-    const accountCounts = {};
-    
-    for (const [email, data] of this.connections.entries()) {
-      if (!accountCounts[email]) {
-        accountCounts[email] = { total: 0, idle: 0, inUse: 0 };
-        stats.accountsWithConnections++;
-      }
+    // Collect detailed stats
+    for (const [key, data] of this.connections.entries()) {
+      const email = key.split(':')[0];
       
-      accountCounts[email].total++;
-      
-      if (data.forIdle) {
-        accountCounts[email].idle++;
-        stats.idleConnections++;
-      }
-      
+      // Count in-use connections
       if (data.inUse) {
-        accountCounts[email].inUse++;
+        stats.inUseConnections++;
       }
+      
+      // Track age distribution
+      const age = now - data.created;
+      if (age < 60 * 1000) stats.connectionsByAge.lessThan1Min++;
+      else if (age < 5 * 60 * 1000) stats.connectionsByAge.lessThan5Min++;
+      else if (age < 15 * 60 * 1000) stats.connectionsByAge.lessThan15Min++;
+      else stats.connectionsByAge.moreThan15Min++;
+      
+      // Track idle time distribution
+      if (!data.inUse) {
+        const idleTime = now - data.lastUsed;
+        if (idleTime < 30 * 1000) stats.idleConnectionsByTime.lessThan30s++;
+        else if (idleTime < 60 * 1000) stats.idleConnectionsByTime.lessThan1Min++;
+        else if (idleTime < 2 * 60 * 1000) stats.idleConnectionsByTime.lessThan2Min++;
+        else stats.idleConnectionsByTime.moreThan2Min++;
+      }
+      
+      // Count connections per account
+      if (!stats.connectionsPerAccount[email]) {
+        stats.connectionsPerAccount[email] = {
+          total: 0,
+          idle: 0,
+          inUse: 0,
+          forIdle: 0
+        };
+      }
+      
+      stats.connectionsPerAccount[email].total++;
+      
+      if (data.inUse) stats.connectionsPerAccount[email].inUse++;
+      else stats.connectionsPerAccount[email].idle++;
+      
+      if (data.forIdle) stats.connectionsPerAccount[email].forIdle++;
     }
     
-    stats.connectionsPerAccount = accountCounts;
+    // Add account health stats
+    for (const [email, health] of this.accountHealth.entries()) {
+      stats.errorRates[email] = {
+        successCount: health.successCount,
+        errorCount: health.errorCount,
+        errorRate: health.successCount + health.errorCount > 0
+          ? (health.errorCount / (health.successCount + health.errorCount)).toFixed(2)
+          : 0,
+        consecutiveErrors: health.consecutiveErrors,
+        lastStatus: health.lastStatus,
+        lastError: health.lastError,
+        inBackoff: this.isInBackoff(email),
+        backoffRemaining: Math.max(0, (health.backoffUntil - now) / 1000).toFixed(0) + 's'
+      };
+    }
+    
     return stats;
+  }
+  
+  /**
+   * Force close all connections and reset the pool
+   * Useful for server shutdown or restart
+   */
+  async shutdown() {
+    console.log(`Shutting down IMAP connection pool (${this.connections.size} connections)`);
+    
+    // Clear intervals
+    clearInterval(this.cleanupInterval);
+    clearInterval(this.healthCheckInterval);
+    
+    // Close all connections
+    const closePromises = [];
+    for (const [key, data] of this.connections.entries()) {
+      closePromises.push(this.closeConnection(key, data.client));
+    }
+    
+    // Wait for all connections to close (with timeout)
+    await Promise.race([
+      Promise.allSettled(closePromises),
+      new Promise(resolve => setTimeout(resolve, 5000))
+    ]);
+    
+    this.connections.clear();
+    console.log('IMAP connection pool shutdown complete');
   }
 }
 
