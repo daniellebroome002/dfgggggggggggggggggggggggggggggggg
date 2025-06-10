@@ -16,7 +16,7 @@ const pendingDatabaseUpdates = new Map(); // Batch DB updates to reduce database
 const aliasToAccountMap = new Map(); // Quick lookup of alias to account
 
 // Configuration
-const MAX_CACHE_SIZE = 1000; // Maximum number of emails to cache
+const MAX_CACHE_SIZE = 100; // Maximum number of emails to cache
 const ALIAS_TTL = 1 * 24 * 60 * 60 * 1000; // 1 day in milliseconds for in-memory cache
 const MAX_RECONNECTION_ATTEMPTS = 5; // Maximum number of reconnection attempts
 const BASE_RECONNECTION_DELAY = 2000; // Base delay for reconnection (2 seconds)
