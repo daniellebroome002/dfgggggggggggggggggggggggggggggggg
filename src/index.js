@@ -18,6 +18,7 @@ import monitorRoutes from './routes/monitor.js';
 import gmailRoutes from './routes/gmailRoutes.js'; // Added Gmail routes
 import debugRoutes from './routes/debug.js'; // Added Debug routes
 import guestRoutes from './routes/guest.js'; // Added Guest routes
+import { encryptResponse } from './middleware/encryption.js'; // Added encryption middleware
 import nodemailer from 'nodemailer';
 import http from 'http'; // Added for WebSocket support
 import { setupWebSocketServer } from './services/gmailImapService.js'; // Added for WebSocket
@@ -115,6 +116,9 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
+// Add encryption middleware (before routes)
+app.use(encryptResponse);
 
 // Health check endpoint
 app.get('/health', async (req, res) => {

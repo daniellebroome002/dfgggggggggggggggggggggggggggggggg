@@ -146,6 +146,80 @@ const publicRateLimit = rateLimit({
   max: 100 // limit each IP to 100 requests per windowMs
 });
 
+// Get featured posts - MUST come before /posts/:slug
+router.get('/posts/featured', publicRateLimit, async (req, res) => {
+  try {
+    // Check cache first
+    const cachedPosts = cache.featuredPosts.get('all');
+    if (cachedPosts && Date.now() < cachedPosts.timestamp + cache.TTL) {
+      return res.json(cachedPosts.data);
+    }
+
+    const [posts] = await pool.query(
+      `SELECT * FROM blog_posts 
+       WHERE is_featured = true AND status = 'published'
+       ORDER BY featured_order ASC, created_at DESC`
+    );
+
+    // Add meta tags to each post
+    const postsWithMeta = posts.map(post => ({
+      ...post,
+      metaTags: generateMetaTags({
+        ...post,
+        canonical_url: `https://boomlify.com/blog/${post.slug}`
+      })
+    }));
+
+    // Cache the results
+    cache.featuredPosts.set('all', {
+      data: postsWithMeta,
+      timestamp: Date.now()
+    });
+
+    res.json(postsWithMeta);
+  } catch (error) {
+    console.error('Failed to fetch featured posts:', error);
+    res.status(500).json({ error: 'Failed to fetch featured posts' });
+  }
+});
+
+// Get trending posts - MUST come before /posts/:slug
+router.get('/posts/trending', publicRateLimit, async (req, res) => {
+  try {
+    // Check cache first
+    const cachedPosts = cache.trendingPosts.get('all');
+    if (cachedPosts && Date.now() < cachedPosts.timestamp + cache.TTL) {
+      return res.json(cachedPosts.data);
+    }
+
+    const [posts] = await pool.query(
+      `SELECT * FROM blog_posts 
+       WHERE is_trending = true AND status = 'published'
+       ORDER BY trending_order ASC, created_at DESC`
+    );
+
+    // Add meta tags to each post
+    const postsWithMeta = posts.map(post => ({
+      ...post,
+      metaTags: generateMetaTags({
+        ...post,
+        canonical_url: `https://boomlify.com/blog/${post.slug}`
+      })
+    }));
+
+    // Cache the results
+    cache.trendingPosts.set('all', {
+      data: postsWithMeta,
+      timestamp: Date.now()
+    });
+
+    res.json(postsWithMeta);
+  } catch (error) {
+    console.error('Failed to fetch trending posts:', error);
+    res.status(500).json({ error: 'Failed to fetch trending posts' });
+  }
+});
+
 // Get all blog posts with SSR meta tags
 router.get('/posts', publicRateLimit, async (req, res) => {
   try {
@@ -527,80 +601,6 @@ router.post('/posts/reorder', async (req, res) => {
     res.status(500).json({ error: 'Failed to reorder posts' });
   } finally {
     connection.release();
-  }
-});
-
-// Get featured posts
-router.get('/posts/featured', publicRateLimit, async (req, res) => {
-  try {
-    // Check cache first
-    const cachedPosts = cache.featuredPosts.get('all');
-    if (cachedPosts && Date.now() < cachedPosts.timestamp + cache.TTL) {
-      return res.json(cachedPosts.data);
-    }
-
-    const [posts] = await pool.query(
-      `SELECT * FROM blog_posts 
-       WHERE is_featured = true AND status = 'published'
-       ORDER BY featured_order ASC, created_at DESC`
-    );
-
-    // Add meta tags to each post
-    const postsWithMeta = posts.map(post => ({
-      ...post,
-      metaTags: generateMetaTags({
-        ...post,
-        canonical_url: `https://boomlify.com/blog/${post.slug}`
-      })
-    }));
-
-    // Cache the results
-    cache.featuredPosts.set('all', {
-      data: postsWithMeta,
-      timestamp: Date.now()
-    });
-
-    res.json(postsWithMeta);
-  } catch (error) {
-    console.error('Failed to fetch featured posts:', error);
-    res.status(500).json({ error: 'Failed to fetch featured posts' });
-  }
-});
-
-// Get trending posts
-router.get('/posts/trending', publicRateLimit, async (req, res) => {
-  try {
-    // Check cache first
-    const cachedPosts = cache.trendingPosts.get('all');
-    if (cachedPosts && Date.now() < cachedPosts.timestamp + cache.TTL) {
-      return res.json(cachedPosts.data);
-    }
-
-    const [posts] = await pool.query(
-      `SELECT * FROM blog_posts 
-       WHERE is_trending = true AND status = 'published'
-       ORDER BY trending_order ASC, created_at DESC`
-    );
-
-    // Add meta tags to each post
-    const postsWithMeta = posts.map(post => ({
-      ...post,
-      metaTags: generateMetaTags({
-        ...post,
-        canonical_url: `https://boomlify.com/blog/${post.slug}`
-      })
-    }));
-
-    // Cache the results
-    cache.trendingPosts.set('all', {
-      data: postsWithMeta,
-      timestamp: Date.now()
-    });
-
-    res.json(postsWithMeta);
-  } catch (error) {
-    console.error('Failed to fetch trending posts:', error);
-    res.status(500).json({ error: 'Failed to fetch trending posts' });
   }
 });
 
