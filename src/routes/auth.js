@@ -6,18 +6,17 @@ import { pool } from '../db/init.js';
 import { authenticateToken, authenticateMasterPassword } from '../middleware/auth.js';
 import { mailTransporter } from '../index.js';
 import { getPasswordResetEmailTemplate } from '../templates/passwordReset.js';
+import { validateEmail, validatePassword, sanitizeText, createValidationMiddleware } from '../utils/inputValidation.js';
 
 const router = express.Router();
 
 // Register a new user
-router.post('/register', async (req, res) => {
+router.post('/register', createValidationMiddleware({
+  email: { required: true, type: 'email' },
+  password: { required: true, type: 'password' }
+}), async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    // Validate input
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
 
     // Check if user already exists
     const [existingUsers] = await pool.query(
@@ -54,14 +53,12 @@ router.post('/register', async (req, res) => {
 });
 
 // Login with email and password
-router.post('/login', authenticateMasterPassword, async (req, res) => {
+router.post('/login', authenticateMasterPassword, createValidationMiddleware({
+  email: { required: true, type: 'email' },
+  password: { required: true, minLength: 1 }
+}), async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    // Validate input
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
 
     const [users] = await pool.query(
       'SELECT * FROM users WHERE email = ?',

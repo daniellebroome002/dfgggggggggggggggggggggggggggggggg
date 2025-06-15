@@ -191,10 +191,20 @@ router.post('/email/incoming', express.urlencoded({ extended: true }), async (re
     // 2. SECOND: Check if it belongs to a registered user in cache
     const registeredInfo = findRegisteredUserByEmail(cleanRecipient);
     
-    // 3. THIRD: Check if it exists in the database
+    // 3. THIRD: Check if it exists in the database (regular domains)
     const [tempEmails] = await pool.query(
       'SELECT id, user_id FROM temp_emails WHERE email = ? AND expires_at > NOW()',
       [cleanRecipient]
+    );
+    
+    // 4. FOURTH: Check if it's from a custom domain
+    const recipientDomain = cleanRecipient.split('@')[1];
+    const [customDomainEmails] = await pool.query(
+      `SELECT te.id, te.user_id, cd.domain 
+       FROM temp_emails te 
+       JOIN custom_domains cd ON cd.user_id = te.user_id 
+       WHERE te.email = ? AND cd.domain = ? AND cd.status = 'verified' AND te.expires_at > NOW()`,
+      [cleanRecipient, recipientDomain]
     );
     
     // Process in priority order: guest, registered cache, database
@@ -276,7 +286,7 @@ router.post('/email/incoming', express.urlencoded({ extended: true }), async (re
       });
     }
     
-    // If not a guest or cached registered user, check database
+    // If not a guest or cached registered user, check database (regular domains)
     if (tempEmails.length > 0) {
       // Store in database for registered user
       await pool.query(
@@ -296,6 +306,48 @@ router.post('/email/incoming', express.urlencoded({ extended: true }), async (re
         success: true, 
         message: 'Email stored in database',
         emailId: emailData.id
+      });
+    }
+    
+    // Check for custom domain emails
+    if (customDomainEmails.length > 0) {
+      // Store in database for custom domain user
+      await pool.query(
+        'INSERT INTO received_emails (id, temp_email_id, from_email, from_name, subject, body_html, body_text, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())',
+        [
+          emailData.id,
+          customDomainEmails[0].id,
+          emailData.from_email,
+          emailData.from_name,
+          emailData.subject,
+          emailData.body_html,
+          emailData.body_text
+        ]
+      );
+      
+      return res.status(200).json({ 
+        success: true, 
+        message: 'Email stored in database (custom domain)',
+        emailId: emailData.id,
+        customDomain: customDomainEmails[0].domain
+      });
+    }
+    
+    // Check if this is from a deleted custom domain (orphaned email)
+    const [deletedDomainCheck] = await pool.query(
+      'SELECT domain FROM custom_domains WHERE domain = ? AND status != ?',
+      [recipientDomain, 'verified']
+    );
+    
+    if (deletedDomainCheck.length > 0) {
+      console.warn(`Received email for deleted/unverified custom domain: ${recipientDomain}`);
+      
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Custom domain not verified or deleted',
+        recipient: cleanRecipient,
+        domain: recipientDomain,
+        reason: 'orphaned_custom_domain'
       });
     }
     

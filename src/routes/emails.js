@@ -4,7 +4,9 @@ import { authenticateToken, authenticateAnyToken } from '../middleware/auth.js';
 import { pool } from '../db/init.js';
 import compression from 'compression';
 import { rateLimitMiddleware, verifyCaptcha, checkCaptchaRequired, rateLimitStore } from '../middleware/rateLimit.js';
+import { customDomainRateLimitMiddleware, incrementCustomDomainUsage, decrementCustomDomainUsage } from '../middleware/customDomainRateLimit.js';
 import nodemailer from 'nodemailer';
+import { validateEmail, sanitizeText, validateInteger, validateUUID, createValidationMiddleware } from '../utils/inputValidation.js';
 import { 
   getTempEmails, 
   getTempEmailById, 
@@ -282,7 +284,7 @@ router.get('/:id/received', authenticateAnyToken, async (req, res) => {
 });
 
 // Create a new temporary email
-router.post('/create', authenticateAnyToken, rateLimitMiddleware, checkCaptchaRequired, verifyCaptcha, async (req, res) => {
+router.post('/create', authenticateAnyToken, rateLimitMiddleware, checkCaptchaRequired, verifyCaptcha, customDomainRateLimitMiddleware, async (req, res) => {
   try {
     const { email, domainId, expiresAt, captchaResponse } = req.body;
     
@@ -363,21 +365,38 @@ router.post('/create', authenticateAnyToken, rateLimitMiddleware, checkCaptchaRe
       // Create email ID
       const id = uuidv4();
       
-      // Verify the domain exists
-      const [domains] = await connection.query(
+      // Verify the domain exists (check both regular domains and custom domains)
+      const [regularDomains] = await connection.query(
         'SELECT * FROM domains WHERE id = ?',
         [domainId]
       );
       
-      if (domains.length === 0) {
-        return res.status(400).json({ error: 'Invalid domain' });
+      const [customDomains] = await connection.query(
+        'SELECT * FROM custom_domains WHERE id = ? AND user_id = ? AND status = ?',
+        [domainId, req.user.id, 'verified']
+      );
+      
+      if (regularDomains.length === 0 && customDomains.length === 0) {
+        return res.status(400).json({ error: 'Invalid domain or domain not verified' });
       }
       
-      // Insert temp email - we already performed a smart check for uniqueness
+      // Determine if this is a regular domain or custom domain
+      const isCustomDomain = customDomains.length > 0;
+      
+      // Insert temp email with proper domain handling
+      if (isCustomDomain) {
+        // For custom domains: set domain_id to NULL, use custom_domain_id
       await connection.query(
-        'INSERT INTO temp_emails (id, user_id, email, domain_id, expires_at) VALUES (?, ?, ?, ?, ?)',
+          'INSERT INTO temp_emails (id, user_id, email, domain_id, custom_domain_id, expires_at) VALUES (?, ?, ?, NULL, ?, ?)',
         [id, req.user.id, email, domainId, mysqlExpiresAt]
       );
+      } else {
+        // For regular domains: use domain_id, set custom_domain_id to NULL
+        await connection.query(
+          'INSERT INTO temp_emails (id, user_id, email, domain_id, custom_domain_id, expires_at) VALUES (?, ?, ?, ?, NULL, ?)',
+          [id, req.user.id, email, domainId, mysqlExpiresAt]
+        );
+      }
       
       // Store IP history
       await connection.query(
@@ -398,6 +417,11 @@ router.post('/create', authenticateAnyToken, rateLimitMiddleware, checkCaptchaRe
       const newEmail = createdEmail[0];
       cacheAddedEmail(req.user.id, newEmail);
       
+      // Increment custom domain usage if applicable
+      if (req.customDomainInfo) {
+        incrementCustomDomainUsage(req.customDomainInfo.id);
+      }
+      
       res.json(newEmail);
     } catch (error) {
       await connection.rollback();
@@ -416,6 +440,20 @@ router.delete('/delete/:id', authenticateToken, async (req, res) => {
   
   try {
     await connection.beginTransaction();
+
+    // Check if this is a custom domain email before deletion (for usage decrement)
+    const [tempEmailCheck] = await connection.query(
+      'SELECT custom_domain_id FROM temp_emails WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
+    );
+
+    if (tempEmailCheck.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Email not found' });
+    }
+
+    const customDomainId = tempEmailCheck[0].custom_domain_id;
+    const isCustomDomainEmail = customDomainId !== null;
 
     // First, delete all received emails
     const [deleteReceivedResult] = await connection.query(
@@ -438,6 +476,11 @@ router.delete('/delete/:id', authenticateToken, async (req, res) => {
     
     // Remove from cache
     removeCachedEmail(req.user.id, req.params.id);
+    
+    // Decrement custom domain usage if this was a custom domain email
+    if (isCustomDomainEmail && customDomainId) {
+      await decrementCustomDomainUsage(customDomainId, req.user.id);
+    }
     
     res.json({ message: 'Email deleted successfully' });
   } catch (error) {
@@ -712,9 +755,9 @@ router.post('/public/create', rateLimitMiddleware, checkCaptchaRequired, verifyC
     await connection.beginTransaction();
 
     try {
-      // Insert temp email
+      // Insert temp email (public endpoint only uses regular domains)
       await connection.query(
-        'INSERT INTO temp_emails (id, email, domain_id, expires_at) VALUES (?, ?, ?, ?)',
+        'INSERT INTO temp_emails (id, email, domain_id, custom_domain_id, expires_at) VALUES (?, ?, ?, NULL, ?)',
         [id, email, domainId, expiresAt]
       );
 

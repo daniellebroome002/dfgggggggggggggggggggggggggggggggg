@@ -531,9 +531,9 @@ export async function migrateGuestSessionToUser(token, userId, realEmail, realPa
       const formattedExpiresAt = formatDate(emailData.expires_at);
       const formattedCreatedAt = formatDate(emailData.created_at);
 
-      // Insert the temp email
+      // Insert the temp email (guest migration only uses regular domains)
       await connection.query(
-        'INSERT INTO temp_emails (id, user_id, email, domain_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO temp_emails (id, user_id, email, domain_id, custom_domain_id, expires_at, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?)',
         [emailId, userId, emailToInsert, emailData.domain_id, formattedExpiresAt, formattedCreatedAt]
       );
       

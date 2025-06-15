@@ -8,7 +8,7 @@ const router = express.Router();
 
 // Helper function to check admin passphrase
 const checkAdminPassphrase = (req) => {
-  return req.headers['admin-access'] === 'esrattormarechudifuck';
+  return req.headers['admin-access'] === process.env.ADMIN_PASSPHRASE;
 };
 
 // Get active messages for the current user

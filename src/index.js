@@ -23,6 +23,7 @@ import nodemailer from 'nodemailer';
 import http from 'http'; // Added for WebSocket support
 import { setupWebSocketServer } from './services/gmailImapService.js'; // Added for WebSocket
 import { setupActivityTracker } from './services/activityTracker.js'; // Add activity tracker
+import { syncAllDomainsToMailserver, checkMailserverHealth } from './services/domainSyncService.js'; // Add domain sync service
 
 dotenv.config();
 
@@ -115,7 +116,9 @@ app.use(cors({
   exposedHeaders: ['Content-Length', 'X-Requested-With', 'X-Request-ID']
 }));
 
-app.use(express.json());
+// Configure body parser with increased size limits
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Add encryption middleware (before routes)
 app.use(encryptResponse);
@@ -210,8 +213,8 @@ function scheduleCleanup() {
 }
 
 // Initialize database and start server
-initializeDatabase().then(() => {
-  server.listen(port, '0.0.0.0', () => {
+initializeDatabase().then(async () => {
+  server.listen(port, '0.0.0.0', async () => {
     console.log(`Server running on port ${port}`);
     scheduleCleanup();
     console.log('Email cleanup scheduler started');
@@ -223,6 +226,32 @@ initializeDatabase().then(() => {
     // Setup WebSocket server for real-time activity tracking
     setupActivityTracker(server);
     console.log('Real-time activity tracking system initialized');
+    
+    // Check mailserver health and sync domains on startup
+    console.log('\n🏥 Checking mailserver health...');
+    const healthCheck = await checkMailserverHealth();
+    
+    if (healthCheck.healthy) {
+      console.log('✅ Mailserver is healthy:', healthCheck.url);
+      
+      // Sync all domains to mailserver
+      const syncResult = await syncAllDomainsToMailserver();
+      
+      if (syncResult.success) {
+        console.log(`🎉 Domain sync completed successfully! Synced: ${syncResult.synced}, Failed: ${syncResult.failed}`);
+        if (syncResult.failed > 0) {
+          console.warn('⚠️ Some domains failed to sync. Check logs above for details.');
+        }
+      } else {
+        console.error('❌ Domain sync failed:', syncResult.error);
+      }
+    } else {
+      console.warn('⚠️ Mailserver health check failed:', healthCheck.error);
+      console.warn('🔄 Skipping domain sync due to mailserver connectivity issues');
+      console.warn('📝 Tip: Check your MAILSERVER_URL and MAILSERVER_TOKEN environment variables');
+    }
+    
+    console.log('\n🚀 Backend startup complete!\n');
   });
 }).catch(error => {
   console.error('Failed to initialize database:', error);

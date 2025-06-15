@@ -19,7 +19,9 @@
     "express-rate-limit": "^7.1.5",
     "googleapis": "^140.0.1",
     "helmet": "^7.1.0",
+    "iconv-lite": "^0.6.3",
     "imapflow": "^1.0.186",
+    "isomorphic-dompurify": "^2.25.0",
     "jsdom": "^24.0.0",
     "jsonwebtoken": "^9.0.2",
     "mailparser": "^3.6.5",
@@ -29,6 +31,7 @@
     "nodemailer": "^6.9.9",
     "sanitize-html": "^2.12.1",
     "uuid": "^9.0.1",
+    "validator": "^13.15.15",
     "ws": "^8.18.1"
   },
   "devDependencies": {

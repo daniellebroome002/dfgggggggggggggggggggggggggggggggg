@@ -234,7 +234,7 @@ export async function migrateGuestSessionToUser(
     const [existingUsers] = await connection.query(
       'SELECT id FROM users WHERE email = ?',
       [realEmail]
-    );
+    ) as any[];
 
     if (existingUsers.length > 0) {
       // User already exists, we can't migrate
@@ -252,9 +252,9 @@ export async function migrateGuestSessionToUser(
 
     // Migrate all temporary emails
     for (const [emailId, emailData] of session.emails) {
-      // Insert temp_email with the real user_id
+      // Insert temp_email with the real user_id (guest migration only uses regular domains)
       await connection.query(
-        'INSERT INTO temp_emails (id, user_id, email, domain_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO temp_emails (id, user_id, email, domain_id, custom_domain_id, expires_at, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?)',
         [
           emailId,
           userId,
